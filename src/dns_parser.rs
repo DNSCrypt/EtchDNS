@@ -16,7 +16,6 @@ pub const DNS_MAX_UDP_PACKET_SIZE: usize = 512; // Standard maximum UDP packet s
 pub const DNS_TYPE_A: u16 = 1;
 pub const DNS_TYPE_NS: u16 = 2;
 pub const DNS_TYPE_CNAME: u16 = 5;
-#[allow(dead_code)]
 pub const DNS_TYPE_SOA: u16 = 6;
 pub const DNS_TYPE_PTR: u16 = 12;
 pub const DNS_TYPE_MX: u16 = 15;
@@ -27,6 +26,14 @@ pub const DNS_TYPE_SRV: u16 = 33;
 pub const DNS_TYPE_OPT: u16 = 41;
 pub const DNS_TYPE_RRSIG: u16 = 46;
 pub const DNS_TYPE_ANY: u16 = 255;
+
+#[cfg(test)]
+pub(crate) const NEGATIVE_RESPONSE_WITH_SOA_TTL_3600_MINIMUM_60: &[u8] = &[
+    0x12, 0x34, 0x81, 0x83, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x07, b'e', b'x', b'a',
+    b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00, 0x00, 0x01, 0x00, 0x01, 0xc0, 0x0c, 0x00,
+    0x06, 0x00, 0x01, 0x00, 0x00, 0x0e, 0x10, 0x00, 0x16, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00,
+    0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x3c,
+];
 
 // DNS classes
 pub const DNS_CLASS_IN: u16 = 1;
@@ -639,6 +646,118 @@ pub fn extract_min_ttl(packet: &[u8]) -> DnsResult<Option<u32>> {
     })?;
 
     Ok(min_ttl)
+}
+
+/// Returns how long a DNS response may be cached.
+///
+/// RFC 2308 limits negative responses to the smaller of the authority SOA record TTL and its MINIMUM field.
+pub fn extract_cache_ttl(packet: &[u8]) -> DnsResult<Option<u32>> {
+    let min_ttl = extract_min_ttl(packet)?;
+    if ancount(packet) != 0 {
+        return Ok(min_ttl);
+    }
+
+    let negative_ttl = extract_negative_ttl(packet)?;
+    Ok(match (min_ttl, negative_ttl) {
+        (Some(min_ttl), Some(negative_ttl)) => Some(min_ttl.min(negative_ttl)),
+        (Some(ttl), None) | (None, Some(ttl)) => Some(ttl),
+        (None, None) => None,
+    })
+}
+
+fn extract_negative_ttl(packet: &[u8]) -> DnsResult<Option<u32>> {
+    let packet_len = packet.len();
+    if packet_len <= DNS_OFFSET_QUESTION {
+        return Err(DnsError::PacketTooShort { offset: 0 });
+    }
+    if packet_len > DNS_MAX_PACKET_SIZE {
+        return Err(DnsError::PacketTooLarge {
+            size: packet_len,
+            max_size: DNS_MAX_PACKET_SIZE,
+        });
+    }
+    if qdcount(packet) == 0 {
+        return Err(DnsError::InvalidPacket("No question".to_string()));
+    }
+
+    let mut offset = skip_name(packet, DNS_OFFSET_QUESTION)?;
+    if packet_len.saturating_sub(offset) < 4 {
+        return Err(DnsError::PacketTooShort { offset });
+    }
+    offset += 4;
+
+    let mut negative_ttl = None;
+    traverse_rrs(packet, offset, nscount(packet) as usize, |rr_offset| {
+        if BigEndian::read_u16(&packet[rr_offset..rr_offset + 2]) != DNS_TYPE_SOA {
+            return Ok(());
+        }
+
+        let soa_ttl = BigEndian::read_u32(&packet[rr_offset + 4..rr_offset + 8]);
+        let rdlen = BigEndian::read_u16(&packet[rr_offset + 8..rr_offset + 10]) as usize;
+        let rdata_offset = rr_offset + 10;
+        let rdata_end = rdata_offset + rdlen;
+
+        let rname_offset = skip_name(packet, rdata_offset)?;
+        if rname_offset > rdata_end {
+            return Err(DnsError::InvalidRecord(
+                "SOA MNAME exceeds record data".to_string(),
+            ));
+        }
+        let fields_offset = skip_name(packet, rname_offset)?;
+        if fields_offset > rdata_end || rdata_end - fields_offset != 20 {
+            return Err(DnsError::InvalidRecord(
+                "SOA record must end with five 32-bit fields".to_string(),
+            ));
+        }
+
+        let minimum = BigEndian::read_u32(&packet[rdata_end - 4..rdata_end]);
+        let ttl = soa_ttl.min(minimum);
+        negative_ttl = Some(negative_ttl.map_or(ttl, |current: u32| current.min(ttl)));
+        Ok(())
+    })?;
+
+    Ok(negative_ttl)
+}
+
+/// Caps a negative response's SOA TTL so it ages with the cached answer.
+pub fn cap_negative_response_ttl(packet: &mut [u8], ttl: u32) -> DnsResult<()> {
+    let packet_len = packet.len();
+    if packet_len <= DNS_OFFSET_QUESTION {
+        return Err(DnsError::PacketTooShort { offset: 0 });
+    }
+    if packet_len > DNS_MAX_PACKET_SIZE {
+        return Err(DnsError::PacketTooLarge {
+            size: packet_len,
+            max_size: DNS_MAX_PACKET_SIZE,
+        });
+    }
+    if qdcount(packet) == 0 {
+        return Err(DnsError::InvalidPacket("No question".to_string()));
+    }
+    if ancount(packet) != 0 {
+        return Ok(());
+    }
+
+    let mut offset = skip_name(packet, DNS_OFFSET_QUESTION)?;
+    if packet_len.saturating_sub(offset) < 4 {
+        return Err(DnsError::PacketTooShort { offset });
+    }
+    offset += 4;
+
+    traverse_rrs_mut(
+        packet,
+        offset,
+        nscount(packet) as usize,
+        |packet, rr_offset| {
+            if BigEndian::read_u16(&packet[rr_offset..rr_offset + 2]) == DNS_TYPE_SOA {
+                let soa_ttl = BigEndian::read_u32(&packet[rr_offset + 4..rr_offset + 8]);
+                BigEndian::write_u32(&mut packet[rr_offset + 4..rr_offset + 8], soa_ttl.min(ttl));
+            }
+            Ok(())
+        },
+    )?;
+
+    Ok(())
 }
 
 /// Changes the TTL of all records in a DNS packet

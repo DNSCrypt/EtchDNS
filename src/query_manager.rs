@@ -936,25 +936,27 @@ impl QueryManager {
             return;
         }
 
-        // Extract the minimum TTL from the response
-        let extracted_ttl = match crate::dns_parser::extract_min_ttl(response_data) {
+        let extracted_ttl = match crate::dns_parser::extract_cache_ttl(response_data) {
             Ok(Some(ttl)) => ttl,
-            _ => self.negative_cache_ttl, // Use configured TTL for negative responses
+            Ok(None) => self.negative_cache_ttl,
+            Err(e) => {
+                log::debug!("Not caching response with an invalid TTL: {e}");
+                return;
+            }
         };
 
-        // Apply the minimum cache TTL if needed
-        // This applies in both authoritative and non-authoritative modes
-        // The difference is that in authoritative mode, we return the original TTL to clients
-        // while in non-authoritative mode, we adjust the TTL based on remaining time
         let ttl = std::cmp::max(extracted_ttl, self.min_cache_ttl);
 
-        // Create a cached response with the TTL
-        // ttl is already in seconds, so we convert it to Duration
+        let mut cached_data = response_data.to_vec();
+        if let Err(e) =
+            crate::dns_parser::cap_negative_response_ttl(&mut cached_data, extracted_ttl)
+        {
+            log::debug!("Not caching response with an invalid SOA TTL: {e}");
+            return;
+        }
         let ttl_duration = std::time::Duration::from_secs(ttl as u64);
-        let cached_response =
-            crate::cache::CachedResponse::new(response_data.to_vec(), ttl_duration);
+        let cached_response = crate::cache::CachedResponse::new(cached_data, ttl_duration);
 
-        // Store the response in the cache
         cache.insert(key.clone(), cached_response);
 
         if ttl > extracted_ttl {
@@ -1475,6 +1477,29 @@ mod tests {
             manager.cache_dns_response(&cache, &key, &response);
             assert!(cache.get(&key).is_none());
         }
+    }
+
+    #[test]
+    fn test_negative_response_uses_soa_minimum_for_cache_expiry() {
+        let manager = QueryManager::for_tests(1, 512, true);
+        let cache = create_dns_cache(10);
+        let key = DNSKey::new("example.com".to_string(), 1, 1, false).unwrap();
+
+        manager.cache_dns_response(
+            &cache,
+            &key,
+            crate::dns_parser::NEGATIVE_RESPONSE_WITH_SOA_TTL_3600_MINIMUM_60,
+        );
+
+        let cached = cache.get(&key).unwrap();
+        assert_eq!(
+            cached.expires_at.duration_since(cached.cached_at).unwrap(),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            crate::dns_parser::extract_min_ttl(&cached.data).unwrap(),
+            Some(60)
+        );
     }
 
     #[tokio::test]

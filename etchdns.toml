@@ -16,7 +16,7 @@ listen_addresses = ["0.0.0.0:53"]
 # Uncomment to enable DoH on port 443 (requires root privileges)
 # doh_listen_addresses = ["0.0.0.0:443"]
 
-# Maximum DNS packet size in bytes (must be between 512 and 65536, default: 4096)
+# Maximum DNS packet size in bytes (512 to 5632, default: 4096)
 # 4096 is a reasonable size that accommodates DNSSEC and other extensions
 dns_packet_len_max = 4096
 

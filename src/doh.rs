@@ -273,27 +273,23 @@ fn create_dns_response(response_data: &[u8]) -> Response<Full<Bytes>> {
         header::HeaderValue::from_static("application/dns-message"),
     );
 
-    // Add cache control headers
     add_cache_headers(&mut http_response, response_data);
 
     http_response
 }
 
-/// Add HTTP caching headers to a DNS response
+/// Keeps the HTTP cache within the DNS TTL limits required by RFC 8484.
 fn add_cache_headers(response: &mut Response<Full<Bytes>>, dns_data: &[u8]) {
-    // RFC 8484: HTTP caches must not keep an answer longer than its smallest TTL
-    let cache_ttl = match crate::dns_parser::extract_min_ttl(dns_data) {
-        Ok(Some(ttl)) => ttl,
-        _ => 10, // Default to 10 seconds if no TTL found
-    };
+    let cache_ttl = crate::dns_parser::extract_cache_ttl(dns_data)
+        .ok()
+        .flatten()
+        .unwrap_or(0);
 
-    // Add Cache-Control header
     let cache_control = format!("public, max-age={cache_ttl}");
     if let Ok(value) = header::HeaderValue::from_str(&cache_control) {
         response.headers_mut().insert(header::CACHE_CONTROL, value);
     }
 
-    // Add Expires header
     let now = std::time::UNIX_EPOCH
         + std::time::Duration::from_secs(
             std::time::SystemTime::now()
@@ -603,6 +599,17 @@ mod tests {
         assert_eq!(
             http_response.headers()[header::CACHE_CONTROL],
             "public, max-age=0"
+        );
+    }
+
+    #[test]
+    fn test_negative_response_uses_soa_minimum_for_http_cache() {
+        let response =
+            create_dns_response(crate::dns_parser::NEGATIVE_RESPONSE_WITH_SOA_TTL_3600_MINIMUM_60);
+
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "public, max-age=60"
         );
     }
 }

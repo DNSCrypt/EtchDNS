@@ -561,11 +561,11 @@ impl Config {
             }
         }
 
-        // Check DNS packet size limits
-        if self.dns_packet_len_max < 512 || self.dns_packet_len_max >= 65536 {
+        if !(512..=dns_parser::DNS_MAX_PACKET_SIZE).contains(&self.dns_packet_len_max) {
             return Err(EtchDnsError::Other(format!(
-                "Invalid DNS packet size: {}. Must be between 512 and 65536 bytes",
-                self.dns_packet_len_max
+                "Invalid DNS packet size: {}. Must be between 512 and {} bytes",
+                self.dns_packet_len_max,
+                dns_parser::DNS_MAX_PACKET_SIZE,
             )));
         }
 
@@ -2847,6 +2847,16 @@ mod tests {
 
         let mut config: Config = toml::from_str("").unwrap();
         config.blocked_ip_ranges = vec!["not a network".to_string()];
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_configured_packet_limit_cannot_exceed_parser_limit() {
+        let mut config: Config = toml::from_str("").unwrap();
+        config.dns_packet_len_max = dns_parser::DNS_MAX_PACKET_SIZE;
+        assert!(config.validate().is_ok());
+
+        config.dns_packet_len_max += 1;
         assert!(config.validate().is_err());
     }
 
