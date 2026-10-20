@@ -102,7 +102,7 @@ etchdns -c /path/to/etchdns.toml
 ### Reliability
 
 - **Automatic failover**: Detects server outages immediately and keeps routing queries without interruption
-- **Serve stale**: Keeps serving expired cache entries when upstream servers fail
+- **Serve stale**: Keeps serving expired cache entries when upstream servers fail, without making clients wait for them
 - **Health monitoring**: Checks upstream servers regularly, at intervals you set
 - **Latency guarantees**: Keeps response times consistent even when upstream servers slow down
 - **Connection limits**: Gives you separate limits for each protocol and for queries still waiting for a response
@@ -133,6 +133,9 @@ etchdns -c /path/to/etchdns.toml
 ```toml
 # Secondary DNS server mode
 authoritative_dns = true
+
+# Keep answering for a week if the primary server goes down
+serve_stale_grace_time = 604800
 ```
 
 This makes EtchDNS a secondary authoritative DNS server for your zones.

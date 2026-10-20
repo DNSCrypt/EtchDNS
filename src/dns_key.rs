@@ -71,6 +71,13 @@ impl DNSKey {
         Ok(key)
     }
 
+    /// Drops the query flags that don't change an authoritative answer, so that all resolvers share one cache entry.
+    pub fn ignore_resolver_flags(&mut self) {
+        self.recursion_desired = false;
+        self.checking_disabled = false;
+        self.authenticated_data = false;
+    }
+
     /// Replaces the ECS part of this key with the subnet sent upstream.
     pub fn set_client_subnet(&mut self, client_ip: &str, prefix_v4: u8, prefix_v6: u8) {
         let Ok(ip) = client_ip.parse::<std::net::IpAddr>() else {

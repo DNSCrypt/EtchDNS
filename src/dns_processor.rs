@@ -136,6 +136,11 @@ pub fn set_response_flags(response_data: &mut [u8], authoritative_dns: bool) {
     if let Err(e) = dns_parser::set_ra(response_data, !authoritative_dns) {
         log::error!("Failed to set RA bit: {e}");
     }
+
+    // We don't validate authoritative answers, so they shouldn't claim to be validated
+    if authoritative_dns && let Err(e) = dns_parser::set_ad(response_data, false) {
+        log::error!("Failed to clear AD bit: {e}");
+    }
 }
 
 /// Trait for processing DNS queries
@@ -370,6 +375,7 @@ fn process_dns_response(
 
 fn adapt_to_client(response: &mut Vec<u8>, query: &[u8]) -> DnsResult<()> {
     dns_parser::set_tid(response, dns_parser::tid(query))?;
+    dns_parser::copy_rd_cd(response, query)?;
     dns_parser::restore_qname_case(response, query)?;
     if !matches!(dns_parser::extract_edns_client_subnet(query), Ok(Some(_))) {
         dns_parser::remove_edns_option(response, dns_parser::EDNS_OPTION_CLIENT_SUBNET)?;
@@ -525,6 +531,20 @@ mod tests {
         let response = create_dns_response(&query, DNS_RCODE_REFUSED, None);
 
         assert!(!dns_parser::is_authenticated_data_requested(&response));
+    }
+
+    #[test]
+    fn test_response_gets_the_rd_and_cd_flags_of_its_query() {
+        let query = create_test_query_with_edns_version(0);
+        let mut first_query = query.clone();
+        first_query[2] &= !0x01;
+        first_query[3] |= 0x10;
+        let mut response = create_dns_response(&first_query, DNS_RCODE_NOERROR, None);
+
+        adapt_to_client(&mut response, &query).unwrap();
+
+        assert!(dns_parser::is_recursion_desired(&response));
+        assert!(!dns_parser::is_checking_disabled(&response));
     }
 
     #[tokio::test]

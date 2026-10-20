@@ -76,11 +76,13 @@ cache_size = 100000
 # Whether this server is authoritative for DNS responses (default: false)
 # If false, TTLs in cached responses will be adjusted based on remaining time
 # If true, referrals also lose the addresses that don't belong to the zone making them
+# If true, the RD, CD and AD flags of queries are not part of the cache key
 authoritative_dns = false
 
 # Grace period in seconds to serve stale (expired) cache entries when upstream servers fail (default: 0)
 # Set to 0 to disable serving stale entries
 # 86400 seconds (1 day) allows continued operation during upstream outages
+# If the upstream servers are down, stale entries are served right away and refreshed in the background
 serve_stale_grace_time = 86400
 
 # TTL in seconds to use when serving stale cache entries (default: 30)

@@ -1836,6 +1836,26 @@ pub fn set_ad(packet: &mut [u8], authenticated_data: bool) -> DnsResult<()> {
     set_flags(packet, current_flags)
 }
 
+/// Clears the RD, CD and AD flags of a query, since they don't change what an authoritative server answers.
+pub fn clear_resolver_flags(query: &mut [u8]) -> DnsResult<()> {
+    set_flags(
+        query,
+        flags(query) & !(DNS_FLAGS_RD | DNS_FLAGS_CD | DNS_FLAGS_AD),
+    )
+}
+
+/// Copies the RD and CD flags of a query into its response, as RFC 1035 and RFC 4035 require.
+pub fn copy_rd_cd(response: &mut [u8], query: &[u8]) -> DnsResult<()> {
+    if response.len() < 4 || query.len() < 4 {
+        return Err(DnsError::PacketTooShort { offset: 0 });
+    }
+    let copied = DNS_FLAGS_RD | DNS_FLAGS_CD;
+    set_flags(
+        response,
+        (flags(response) & !copied) | (flags(query) & copied),
+    )
+}
+
 /// Sets the answer count in a DNS packet
 pub fn set_ancount(packet: &mut [u8], count: u16) -> DnsResult<()> {
     if packet.len() < 8 {

@@ -260,6 +260,15 @@ impl GlobalStats {
 
         resolvers
     }
+
+    /// Checks whether every resolver missed enough queries in a row to be considered down
+    pub fn all_resolvers_failing(&self) -> bool {
+        !self.resolver_stats.is_empty()
+            && self
+                .resolver_stats
+                .values()
+                .all(|stats| stats.consecutive_failures >= PARK_AFTER_FAILURES)
+    }
 }
 
 impl Default for GlobalStats {
@@ -340,6 +349,12 @@ impl SharedStats {
     pub async fn get_resolvers_by_speed(&self) -> Vec<(SocketAddr, f64)> {
         let stats = self.inner.lock().await;
         stats.get_resolvers_by_speed()
+    }
+
+    /// Checks whether every resolver missed enough queries in a row to be considered down
+    pub async fn all_resolvers_failing(&self) -> bool {
+        let stats = self.inner.lock().await;
+        stats.all_resolvers_failing()
     }
 
     /// Increment the UDP receive errors counter
@@ -449,5 +464,22 @@ mod tests {
             MIN_PARK_DURATION * 2
         );
         assert_eq!(park_duration(u64::MAX), MAX_PARK_DURATION);
+    }
+
+    #[test]
+    fn test_resolvers_are_failing_until_one_answers() {
+        let mut stats = GlobalStats::new();
+        let first: SocketAddr = "192.0.2.1:53".parse().unwrap();
+        let second: SocketAddr = "192.0.2.2:53".parse().unwrap();
+        assert!(!stats.all_resolvers_failing());
+
+        for _ in 1..PARK_AFTER_FAILURES {
+            stats.record_timeout(first);
+        }
+        assert!(!stats.all_resolvers_failing());
+        stats.record_timeout(first);
+        assert!(stats.all_resolvers_failing());
+        stats.record_success(second, Duration::from_millis(10));
+        assert!(!stats.all_resolvers_failing());
     }
 }

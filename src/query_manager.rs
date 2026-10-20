@@ -353,6 +353,10 @@ impl QueryManager {
         if self.enable_ecs {
             key.set_client_subnet(client_ip, self.ecs_prefix_v4, self.ecs_prefix_v6);
         }
+        if self.authoritative_dns {
+            key.ignore_resolver_flags();
+            crate::dns_parser::clear_resolver_flags(&mut query_data)?;
+        }
 
         // Record client query in stats
         if let Some(stats) = &self.stats {
@@ -374,7 +378,17 @@ impl QueryManager {
             return Ok(cache_response);
         }
 
-        match self.manage_in_flight_queries(&key).await {
+        // If every upstream server is failing, answer with stale data now, and let the query below refresh it
+        let stale_response = if self.serve_stale_grace_time > 0
+            && let Some(stats) = &self.stats
+            && stats.all_resolvers_failing().await
+        {
+            self.serve_stale(&key, "recent upstream failures")
+        } else {
+            None
+        };
+
+        let receiver = match self.manage_in_flight_queries(&key).await {
             Ok((mut in_flight_queries, mut query_slab)) => {
                 // Create a new task to handle the query
                 let (task, receiver) = self
@@ -415,7 +429,11 @@ impl QueryManager {
                     Err(DnsError::Other("Failed to manage in-flight queries".to_string()).into())
                 }
             }
-        }
+        };
+
+        stale_response.map_or(receiver, |response| {
+            Ok(Self::receiver_with_response(response))
+        })
     }
 
     /// Get the number of in-flight queries
@@ -445,13 +463,7 @@ impl QueryManager {
         rcode: u8,
         authoritative_dns: bool,
         log_msg: Option<&str>,
-    ) -> (
-        broadcast::Sender<DnsResponse>,
-        broadcast::Receiver<DnsResponse>,
-    ) {
-        // Create a response channel
-        let (response_sender, receiver) = broadcast::channel(MAX_RECEIVERS);
-
+    ) -> broadcast::Receiver<DnsResponse> {
         // Create the basic DNS response
         let mut dns_response =
             crate::dns_processor::create_dns_response(query_data, rcode, log_msg);
@@ -459,24 +471,10 @@ impl QueryManager {
         // Set the appropriate DNS response flags
         crate::dns_processor::set_response_flags(&mut dns_response, authoritative_dns);
 
-        // Create the response object
-        let response = DnsResponse {
+        Self::receiver_with_response(DnsResponse {
             data: dns_response,
             error: None,
-        };
-
-        // Send the response
-        if let Err(e) = response_sender.send(response) {
-            let rcode_name = match rcode {
-                crate::dns_processor::DNS_RCODE_NOTIMP => "NOTIMP",
-                crate::dns_processor::DNS_RCODE_NXDOMAIN => "NXDOMAIN",
-                crate::dns_processor::DNS_RCODE_REFUSED => "REFUSED",
-                _ => "unknown",
-            };
-            log::debug!("Failed to send {rcode_name} response: {e}");
-        }
-
-        (response_sender, receiver)
+        })
     }
 
     /// Creates a new query task to handle a DNS query
@@ -535,34 +533,12 @@ impl QueryManager {
                         });
                         match result {
                             Ok(response_data) => {
-                                // Check if the response is a SERVFAIL and we should serve stale entries
-                                #[allow(clippy::nonminimal_bool)]
-                                if self_clone.serve_stale_grace_time > 0
-                                    && crate::dns_parser::rcode(&response_data)
-                                        == crate::dns_processor::DNS_RCODE_SERVFAIL
+                                if crate::dns_parser::rcode(&response_data)
+                                    == crate::dns_processor::DNS_RCODE_SERVFAIL
+                                    && let Some(stale_response) =
+                                        self_clone.serve_stale(&key_clone, "SERVFAIL response")
                                 {
-                                    log::debug!(
-                                        "Received SERVFAIL response for {}",
-                                        key_clone.name
-                                    );
-
-                                    // Check if we have a cached entry (even expired)
-                                    if let Some(cache) = &self_clone.cache
-                                        && let Some(cached_response) = cache.get(&key_clone)
-                                        && cached_response.is_expired()
-                                        && std::time::SystemTime::now()
-                                            .duration_since(cached_response.expires_at)
-                                            .is_ok_and(|age| {
-                                                age.as_secs() <= self_clone.serve_stale_grace_time
-                                            })
-                                    {
-                                        break 'resolve Self::handle_stale_cache_entry(
-                                            &key_clone,
-                                            &cached_response,
-                                            self_clone.serve_stale_ttl,
-                                            "SERVFAIL response",
-                                        );
-                                    }
+                                    break 'resolve stale_response;
                                 }
 
                                 if let Some(cache) = &self_clone.cache {
@@ -592,41 +568,12 @@ impl QueryManager {
                                 // Log the error
                                 log::debug!("Failed to resolve DNS query: {e}");
 
-                                // Check if we should serve stale entries when upstream fails
-                                if self_clone.serve_stale_grace_time > 0 {
-                                    // Check if we have a stale entry in the cache
-                                    if let Some(cache) = &self_clone.cache
-                                        && let Some(cached_response) = cache.get(&key_clone)
-                                    {
-                                        // Serve stale entry even if expired, as long as it's within grace period
-                                        let expired_ago = if cached_response.is_expired() {
-                                            match std::time::SystemTime::now()
-                                                .duration_since(cached_response.expires_at)
-                                            {
-                                                Ok(duration) => duration.as_secs(),
-                                                Err(_) => 0,
-                                            }
-                                        } else {
-                                            0 // Not expired yet
-                                        };
-
-                                        // Check if the entry is within the grace period
-                                        if expired_ago <= self_clone.serve_stale_grace_time {
-                                            break 'resolve Self::handle_stale_cache_entry(
-                                                &key_clone,
-                                                &cached_response,
-                                                self_clone.serve_stale_ttl,
-                                                &format!("upstream error: {e}"),
-                                            );
-                                        }
-                                    }
-                                }
-
-                                // No stale entry available, create an error response
-                                DnsResponse {
-                                    data: Vec::new(),
-                                    error: Some(format!("DNS query failed: {e}")),
-                                }
+                                self_clone
+                                    .serve_stale(&key_clone, &format!("upstream error: {e}"))
+                                    .unwrap_or_else(|| DnsResponse {
+                                        data: Vec::new(),
+                                        error: Some(format!("DNS query failed: {e}")),
+                                    })
                             }
                         }
                     }
@@ -634,42 +581,14 @@ impl QueryManager {
                         // The resolver timed out
                         log::debug!("DNS query timed out after {server_timeout} seconds");
 
-                        // Check if we should serve stale entries
-                        if self_clone.serve_stale_grace_time > 0 {
-                            // Check if we have a stale entry in the cache
-                            if let Some(cache) = &self_clone.cache
-                                && let Some(cached_response) = cache.get(&key_clone)
-                            {
-                                // Check if the cached response has expired but is within the grace period
-                                if cached_response.is_expired() {
-                                    // Calculate how long ago the entry expired
-                                    let expired_ago = match std::time::SystemTime::now()
-                                        .duration_since(cached_response.expires_at)
-                                    {
-                                        Ok(duration) => duration.as_secs(),
-                                        Err(_) => 0, // This shouldn't happen, but just in case
-                                    };
-
-                                    // Check if the entry is within the grace period
-                                    if expired_ago <= self_clone.serve_stale_grace_time {
-                                        break 'resolve Self::handle_stale_cache_entry(
-                                            &key_clone,
-                                            &cached_response,
-                                            self_clone.serve_stale_ttl,
-                                            &format!("timeout (expired {expired_ago} seconds ago)"),
-                                        );
-                                    }
-                                }
-                            }
-                        }
-
-                        // Create a timeout error response
-                        DnsResponse {
-                            data: Vec::new(),
-                            error: Some(format!(
-                                "DNS query timed out after {server_timeout} seconds"
-                            )),
-                        }
+                        self_clone
+                            .serve_stale(&key_clone, "timeout")
+                            .unwrap_or_else(|| DnsResponse {
+                                data: Vec::new(),
+                                error: Some(format!(
+                                    "DNS query timed out after {server_timeout} seconds"
+                                )),
+                            })
                     }
                 }
             };
@@ -693,40 +612,40 @@ impl QueryManager {
         (task, receiver)
     }
 
-    /// Helper function to handle stale cache entries
-    fn handle_stale_cache_entry(
-        key: &DNSKey,
-        cached_response: &crate::cache::CachedResponse,
-        serve_stale_ttl: u32,
-        reason: &str,
-    ) -> DnsResponse {
-        log::debug!(
-            "Serving stale entry for {} after {} (expired)",
-            key.name,
-            reason
-        );
+    /// Answers with the cached entry if it's still within the serve-stale grace period
+    fn serve_stale(&self, key: &DNSKey, reason: &str) -> Option<DnsResponse> {
+        if self.serve_stale_grace_time == 0 {
+            return None;
+        }
+        let cached_response = self.cache.as_ref()?.get(key)?;
+        let expired_for = std::time::SystemTime::now()
+            .duration_since(cached_response.expires_at)
+            .unwrap_or_default();
+        if expired_for.as_secs() > self.serve_stale_grace_time {
+            return None;
+        }
+        log::debug!("Serving stale entry for {} after {reason}", key.name);
 
-        // Create a response from the stale cached data
-        let mut response_data = cached_response.data.clone();
-
-        // Set the TTL to the configured stale TTL
-        if let Err(e) = crate::dns_parser::change_ttl(&mut response_data, serve_stale_ttl) {
+        let mut response_data = cached_response.data;
+        if let Err(e) = crate::dns_parser::change_ttl(&mut response_data, self.serve_stale_ttl) {
             log::debug!("Failed to update TTL in stale response: {e}");
-        } else {
-            log::debug!("Set TTL in stale response to {serve_stale_ttl} seconds");
         }
 
-        // Get the authoritative_dns setting from the QueryManager
-        // For stale entries, we're always acting as a cache, so authoritative_dns should be false
-        let authoritative_dns = false;
+        // Resolvers may reject an authoritative server's answer if AA isn't set
+        crate::dns_processor::set_response_flags(&mut response_data, self.authoritative_dns);
 
-        // Set the appropriate DNS response flags
-        crate::dns_processor::set_response_flags(&mut response_data, authoritative_dns);
-
-        DnsResponse {
+        Some(DnsResponse {
             data: response_data,
             error: None,
+        })
+    }
+
+    fn receiver_with_response(response: DnsResponse) -> broadcast::Receiver<DnsResponse> {
+        let (response_sender, receiver) = broadcast::channel(1);
+        if let Err(e) = response_sender.send(response) {
+            log::debug!("Failed to send DNS response: {e}");
         }
+        receiver
     }
 
     /// Manages in-flight queries and handles query limits
@@ -852,9 +771,6 @@ impl QueryManager {
                         stats.record_cache_hit().await;
                     }
 
-                    // Create a response channel
-                    let (response_sender, receiver) = broadcast::channel(MAX_RECEIVERS);
-
                     // Create a successful response from the cached data
                     let mut response_data = cached_response.data.clone();
 
@@ -881,17 +797,10 @@ impl QueryManager {
                         self.authoritative_dns,
                     );
 
-                    let response = DnsResponse {
+                    return Some(Self::receiver_with_response(DnsResponse {
                         data: response_data,
                         error: None,
-                    };
-
-                    // Send the cached response
-                    if let Err(e) = response_sender.send(response) {
-                        log::debug!("Failed to send cached DNS response: {e}");
-                    }
-
-                    return Some(receiver);
+                    }));
                 } else {
                     log::debug!(
                         "Cache hit for query: {}, but response has expired",
@@ -994,7 +903,7 @@ impl QueryManager {
                     log::debug!("Hook returned -1, returning REFUSED response");
 
                     let log_msg = format!("Query refused by hook: {}", key.name);
-                    let (_, receiver) = Self::create_and_send_response_with_flags(
+                    let receiver = Self::create_and_send_response_with_flags(
                         query_data,
                         crate::dns_processor::DNS_RCODE_REFUSED,
                         self.authoritative_dns,
@@ -1009,19 +918,12 @@ impl QueryManager {
                         "Hook returned unexpected value: {hook_result}, returning error response"
                     );
 
-                    let (response_sender, receiver) = broadcast::channel(MAX_RECEIVERS);
-                    let response = DnsResponse {
+                    Some(Self::receiver_with_response(DnsResponse {
                         data: Vec::new(),
                         error: Some(format!(
                             "Query processing interrupted by hook (code: {hook_result})"
                         )),
-                    };
-
-                    if let Err(e) = response_sender.send(response) {
-                        log::debug!("Failed to send hook-interrupted response: {e}");
-                    }
-
-                    Some(receiver)
+                    }))
                 }
             }
         } else {
@@ -1044,7 +946,7 @@ impl QueryManager {
                 key.name
             );
 
-            let (_, receiver) = Self::create_and_send_response_with_flags(
+            let receiver = Self::create_and_send_response_with_flags(
                 query_data,
                 crate::dns_processor::DNS_RCODE_NOTIMP,
                 self.authoritative_dns,
@@ -1057,7 +959,7 @@ impl QueryManager {
         if key.qclass == crate::dns_parser::DNS_CLASS_CH {
             let log_msg = format!("Received CHAOS query for {}, returning REFUSED", key.name);
 
-            let (_, receiver) = Self::create_and_send_response_with_flags(
+            let receiver = Self::create_and_send_response_with_flags(
                 query_data,
                 crate::dns_processor::DNS_RCODE_REFUSED,
                 self.authoritative_dns,
@@ -1074,7 +976,7 @@ impl QueryManager {
             log::debug!("Query for nonexistent domain: {}", key.name);
 
             let log_msg = format!("Query for nonexistent domain: {}", key.name);
-            let (_, receiver) = Self::create_and_send_response_with_flags(
+            let receiver = Self::create_and_send_response_with_flags(
                 query_data,
                 crate::dns_processor::DNS_RCODE_NXDOMAIN,
                 self.authoritative_dns,
@@ -1091,7 +993,7 @@ impl QueryManager {
             log::warn!("Query rejected: {} is not in allowed zones", key.name);
 
             let log_msg = format!("Query rejected: {} is not in allowed zones", key.name);
-            let (_, receiver) = Self::create_and_send_response_with_flags(
+            let receiver = Self::create_and_send_response_with_flags(
                 query_data,
                 crate::dns_processor::DNS_RCODE_REFUSED,
                 self.authoritative_dns,
@@ -1175,6 +1077,7 @@ mod tests {
     use crate::dns_key::DNSKey;
     use crate::stats::SharedStats;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     /// Test that stale cache entries are served when upstream resolver fails
@@ -1262,10 +1165,6 @@ mod tests {
         ];
 
         // Create a resolver that always fails (simulates timeout/error)
-        let failing_resolver = |_data: Vec<u8>| {
-            Box::pin(async { Err(DnsError::UpstreamTimeout) })
-                as futures::future::BoxFuture<'static, DnsResult<Vec<u8>>>
-        };
 
         // Submit the query with the failing resolver
         let mut receiver = query_manager
@@ -1341,10 +1240,6 @@ mod tests {
         ];
 
         // Create a failing resolver
-        let failing_resolver = |_data: Vec<u8>| {
-            Box::pin(async { Err(DnsError::UpstreamTimeout) })
-                as futures::future::BoxFuture<'static, DnsResult<Vec<u8>>>
-        };
 
         // Submit the query
         let mut receiver = query_manager
@@ -1609,10 +1504,6 @@ mod tests {
         let in_flight_guard = query_manager.in_flight_queries.lock().await;
         let second_manager = query_manager.clone();
         let mut second = tokio_test::task::spawn(async move {
-            let failing_resolver = |_data: Vec<u8>| {
-                Box::pin(async { Err(DnsError::UpstreamTimeout) })
-                    as futures::future::BoxFuture<'static, DnsResult<Vec<u8>>>
-            };
             let mut receiver = second_manager
                 .submit_query_with_client(key, query, failing_resolver, "192.0.2.2:5353")
                 .await
@@ -1636,5 +1527,173 @@ mod tests {
         let response = response.expect("the second client must receive the shared response");
         assert!(response.error.is_none());
         assert!(crate::dns_parser::is_response(&response.data));
+    }
+
+    const EXAMPLE_COM_QUERY: &[u8] = &[
+        0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, b'e', b'x',
+        b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00, 0x00, 0x01, 0x00, 0x01,
+    ];
+
+    /// Answers `EXAMPLE_COM_QUERY` with a 60-second TTL
+    const EXAMPLE_COM_ANSWER: &[u8] = &[
+        0x12, 0x34, 0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x07, b'e', b'x',
+        b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00, 0x00, 0x01, 0x00, 0x01, 0xc0,
+        0x0c, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c, 0x00, 0x04, 192, 0, 2, 1,
+    ];
+
+    fn failing_resolver(_data: Vec<u8>) -> futures::future::BoxFuture<'static, DnsResult<Vec<u8>>> {
+        Box::pin(async { Err(DnsError::UpstreamTimeout) })
+    }
+
+    /// A manager that serves stale answers, with an expired answer to `EXAMPLE_COM_QUERY` in its cache
+    fn manager_with_expired_entry(
+        authoritative_dns: bool,
+    ) -> (QueryManager, crate::cache::SyncDnsCache, DNSKey) {
+        let mut query_manager = QueryManager::for_tests(5, 512, true);
+        query_manager.authoritative_dns = authoritative_dns;
+        query_manager.serve_stale_grace_time = 3600;
+        let cache = create_dns_cache(10);
+        query_manager.set_cache(cache.clone());
+        let mut key = DNSKey::from_packet(EXAMPLE_COM_QUERY).unwrap();
+        if authoritative_dns {
+            key.ignore_resolver_flags();
+        }
+        let expires_at = std::time::SystemTime::now() - Duration::from_secs(60);
+        let expired = CachedResponse {
+            data: EXAMPLE_COM_ANSWER.to_vec(),
+            cached_at: expires_at - Duration::from_secs(60),
+            expires_at,
+        };
+        cache.insert(key.clone(), expired);
+        (query_manager, cache, key)
+    }
+
+    #[tokio::test]
+    async fn test_stale_answer_keeps_the_authoritative_flags() {
+        let (query_manager, _, key) = manager_with_expired_entry(true);
+        let mut receiver = query_manager
+            .submit_query_with_client(
+                key,
+                EXAMPLE_COM_QUERY.to_vec(),
+                failing_resolver,
+                "192.0.2.1:5353",
+            )
+            .await
+            .unwrap();
+
+        let flags = crate::dns_parser::flags(&receiver.recv().await.unwrap().data);
+        assert_ne!(flags & 0x0400, 0, "AA must be set");
+        assert_eq!(flags & 0x0080, 0, "RA must not be set");
+    }
+
+    #[tokio::test]
+    async fn test_stale_answer_does_not_wait_for_failing_upstream_servers() {
+        let (query_manager, cache, key) = manager_with_expired_entry(false);
+        let stats = query_manager.get_stats().unwrap();
+        for _ in 0..crate::stats::PARK_AFTER_FAILURES {
+            stats.record_timeout("192.0.2.53:53".parse().unwrap()).await;
+        }
+
+        // The upstream server stays silent until we release it
+        let release = Arc::new(tokio::sync::Notify::new());
+        let resolver = {
+            let release = release.clone();
+            move |_data: Vec<u8>| {
+                let release = release.clone();
+                Box::pin(async move {
+                    release.notified().await;
+                    Ok(EXAMPLE_COM_ANSWER.to_vec())
+                }) as futures::future::BoxFuture<'static, DnsResult<Vec<u8>>>
+            }
+        };
+        let mut receiver = query_manager
+            .submit_query_with_client(
+                key.clone(),
+                EXAMPLE_COM_QUERY.to_vec(),
+                resolver,
+                "192.0.2.1:5353",
+            )
+            .await
+            .unwrap();
+
+        let response = receiver
+            .try_recv()
+            .expect("the stale answer must not wait for the upstream server");
+        assert_eq!(
+            crate::dns_parser::extract_min_ttl(&response.data).unwrap(),
+            Some(query_manager.serve_stale_ttl)
+        );
+
+        // The entry is refreshed in the background
+        release.notify_one();
+        for _ in 0..100 {
+            if !cache.get(&key).unwrap().is_expired() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(!cache.get(&key).unwrap().is_expired());
+    }
+
+    #[tokio::test]
+    async fn test_expired_entry_waits_for_the_upstream_server() {
+        let (query_manager, _, key) = manager_with_expired_entry(false);
+        let resolver = |_data: Vec<u8>| {
+            Box::pin(std::future::ready(Ok(EXAMPLE_COM_ANSWER.to_vec())))
+                as futures::future::BoxFuture<'static, DnsResult<Vec<u8>>>
+        };
+        let mut receiver = query_manager
+            .submit_query_with_client(key, EXAMPLE_COM_QUERY.to_vec(), resolver, "192.0.2.1:5353")
+            .await
+            .unwrap();
+
+        let response = receiver.recv().await.unwrap();
+        assert_eq!(
+            crate::dns_parser::extract_min_ttl(&response.data).unwrap(),
+            Some(60)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_authoritative_answer_is_shared_by_queries_with_different_flags() {
+        let mut query_manager = QueryManager::for_tests(5, 512, true);
+        query_manager.authoritative_dns = true;
+        query_manager.set_cache(create_dns_cache(10));
+
+        let upstream_queries = Arc::new(AtomicUsize::new(0));
+        // RD, CD and AD together, then none, then one at a time
+        for flags in [
+            [0x01, 0x30],
+            [0x00, 0x00],
+            [0x01, 0x00],
+            [0x00, 0x10],
+            [0x00, 0x20],
+        ] {
+            let mut query = EXAMPLE_COM_QUERY.to_vec();
+            query[2..4].copy_from_slice(&flags);
+            let key = DNSKey::from_packet(&query).unwrap();
+            let resolver = {
+                let upstream_queries = upstream_queries.clone();
+                move |data: Vec<u8>| {
+                    upstream_queries.fetch_add(1, Ordering::SeqCst);
+                    // The answer echoes the flags the upstream server got, and claims AD
+                    let mut answer = EXAMPLE_COM_ANSWER.to_vec();
+                    answer[2..4].copy_from_slice(&data[2..4]);
+                    crate::dns_parser::set_qr(&mut answer, true).unwrap();
+                    crate::dns_parser::set_ad(&mut answer, true).unwrap();
+                    Box::pin(std::future::ready(Ok(answer)))
+                        as futures::future::BoxFuture<'static, DnsResult<Vec<u8>>>
+                }
+            };
+            let mut receiver = query_manager
+                .submit_query_with_client(key, query, resolver, "192.0.2.1:5353")
+                .await
+                .unwrap();
+
+            let response = receiver.recv().await.unwrap();
+            assert_eq!(crate::dns_parser::flags(&response.data) & 0x0130, 0);
+        }
+
+        assert_eq!(upstream_queries.load(Ordering::SeqCst), 1);
     }
 }
