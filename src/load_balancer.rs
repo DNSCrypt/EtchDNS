@@ -1,9 +1,8 @@
-use crate::stats::SharedStats;
+use crate::stats::{GlobalStats, SharedStats};
 use log::debug;
 use rand::{RngExt, rng};
 use std::net::SocketAddr;
 use std::str::FromStr;
-use std::sync::Arc;
 
 /// Load balancing strategy for selecting upstream DNS servers
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -42,96 +41,98 @@ impl std::fmt::Display for LoadBalancingStrategy {
     }
 }
 
-/// Select an upstream server based on the load balancing strategy
-pub async fn select_upstream_server<'a>(
-    upstream_servers: &'a [String],
+/// Selects an upstream server among the candidates.
+///
+/// The stats stay locked from the choice to the trial reservation, so that two queries can't both take the trial of a parked server.
+pub async fn select_upstream_server(
+    candidates: &[SocketAddr],
     strategy: LoadBalancingStrategy,
-    stats: Option<&Arc<SharedStats>>,
-) -> Option<&'a String> {
-    let server = pick_upstream_server(upstream_servers, strategy, stats).await?;
-    if let Some(stats) = stats
-        && let Ok(addr) = server.parse::<SocketAddr>()
-    {
-        stats.record_query_sent(addr).await;
+    stats: Option<&SharedStats>,
+) -> Option<SocketAddr> {
+    match stats {
+        Some(stats) => choose_upstream_server(candidates, strategy, Some(&mut *stats.lock().await)),
+        None => choose_upstream_server(candidates, strategy, None),
+    }
+}
+
+/// Picks an upstream server among the candidates, and records that a query is going to it.
+///
+/// Parked servers are only picked when every candidate is parked.
+pub fn choose_upstream_server(
+    candidates: &[SocketAddr],
+    strategy: LoadBalancingStrategy,
+    stats: Option<&mut GlobalStats>,
+) -> Option<SocketAddr> {
+    let unparked: Vec<SocketAddr> = candidates
+        .iter()
+        .filter(|addr| !stats.as_ref().is_some_and(|stats| stats.is_parked(addr)))
+        .copied()
+        .collect();
+    let candidates = if unparked.is_empty() {
+        candidates
+    } else {
+        &unparked
+    };
+    let server = pick_upstream_server(candidates, strategy, stats.as_deref())?;
+    if let Some(stats) = stats {
+        stats.record_query_sent(server);
     }
     Some(server)
 }
 
-async fn pick_upstream_server<'a>(
-    upstream_servers: &'a [String],
+fn pick_upstream_server(
+    upstream_servers: &[SocketAddr],
     strategy: LoadBalancingStrategy,
-    stats: Option<&Arc<SharedStats>>,
-) -> Option<&'a String> {
+    stats: Option<&GlobalStats>,
+) -> Option<SocketAddr> {
     if upstream_servers.is_empty() {
         return None;
     }
 
     // If there's only one server, return it
     if upstream_servers.len() == 1 {
-        return Some(&upstream_servers[0]);
+        return Some(upstream_servers[0]);
     }
 
     match strategy {
         LoadBalancingStrategy::Random => {
             // Use a simple random index
             let index = rng().random_range(0..upstream_servers.len());
-            Some(&upstream_servers[index])
+            Some(upstream_servers[index])
         }
         LoadBalancingStrategy::Fastest => {
             // If we don't have stats, fall back to random
-            if stats.is_none() {
+            let Some(stats) = stats else {
                 debug!("No stats available for fastest strategy, falling back to random");
                 let index = rng().random_range(0..upstream_servers.len());
-                return Some(&upstream_servers[index]);
-            }
+                return Some(upstream_servers[index]);
+            };
 
-            let stats = stats.unwrap();
-            let resolvers_by_speed = stats.get_resolvers_by_speed().await;
-
-            // If we don't have any stats yet, fall back to random
-            if resolvers_by_speed.is_empty() {
+            // If we don't have any stats for the candidates yet, fall back to random
+            let Some(&(addr, _)) = stats.get_resolvers_by_speed(upstream_servers).first() else {
                 debug!("No resolver stats available yet, falling back to random");
                 let index = rng().random_range(0..upstream_servers.len());
-                return Some(&upstream_servers[index]);
-            }
-
-            // Find the fastest resolver that's in our upstream_servers list
-            for (addr, _) in resolvers_by_speed {
-                if let Some(server) = upstream_servers
-                    .iter()
-                    .find(|s| s.parse::<SocketAddr>() == Ok(addr))
-                {
-                    debug!("Selected fastest server: {server}");
-                    return Some(server);
-                }
-            }
-
-            // If none of the resolvers in our stats are in upstream_servers, fall back to random
-            debug!("No matching resolver found in stats, falling back to random");
-            let index = rng().random_range(0..upstream_servers.len());
-            Some(&upstream_servers[index])
+                return Some(upstream_servers[index]);
+            };
+            debug!("Selected fastest server: {addr}");
+            Some(addr)
         }
         LoadBalancingStrategy::PowerOfTwo => {
-            // If we don't have stats or have fewer than 2 servers, fall back to random
-            if stats.is_none() || upstream_servers.len() < 2 {
-                debug!(
-                    "No stats available for p2 strategy or fewer than 2 servers, falling back to random"
-                );
+            // If we don't have stats, fall back to random
+            let Some(stats) = stats else {
+                debug!("No stats available for p2 strategy, falling back to random");
                 let index = rng().random_range(0..upstream_servers.len());
-                return Some(&upstream_servers[index]);
-            }
+                return Some(upstream_servers[index]);
+            };
 
-            let stats = stats.unwrap();
+            // Only the candidates count, so that a faster server in backoff doesn't make them look slow
+            let resolvers_by_speed = stats.get_resolvers_by_speed(upstream_servers);
 
-            // Get all resolvers sorted by speed (fastest first)
-            let resolvers_by_speed = stats.get_resolvers_by_speed().await;
-            let global_stats = stats.get_stats().await;
-
-            // If we don't have any stats yet, fall back to random
+            // If we don't have any stats for the candidates yet, fall back to random
             if resolvers_by_speed.is_empty() {
                 debug!("No resolver stats available yet, falling back to random");
                 let index = rng().random_range(0..upstream_servers.len());
-                return Some(&upstream_servers[index]);
+                return Some(upstream_servers[index]);
             }
 
             // Get the fastest server's response time
@@ -141,43 +142,29 @@ async fn pick_upstream_server<'a>(
             let threshold = fastest_time * 1.5;
 
             // Create a list of eligible servers (not more than 50% slower than the fastest)
-            let mut eligible_servers: Vec<&String> = Vec::new();
+            let mut eligible_servers: Vec<SocketAddr> = Vec::new();
 
-            for server in upstream_servers {
-                // Parse the server address
-                match server.parse::<SocketAddr>() {
-                    Ok(addr) => {
-                        // Find this server in the resolvers_by_speed list
-                        if let Some((_, response_time)) =
-                            resolvers_by_speed.iter().find(|(a, _)| *a == addr)
-                        {
-                            // Check if this server is within the threshold
-                            if *response_time <= threshold {
-                                eligible_servers.push(server);
-                                debug!(
-                                    "Server {server} with response time {response_time}ms is eligible (threshold: {threshold}ms)"
-                                );
-                            } else {
-                                debug!(
-                                    "Server {server} with response time {response_time}ms is too slow (threshold: {threshold}ms)"
-                                );
-                            }
-                        } else {
-                            if global_stats.get_resolver_stats(&addr).is_none() {
-                                eligible_servers.push(server);
-                                debug!("Server {server} has no stats, including it as eligible");
-                            } else {
-                                debug!("Server {server} has no successful probes, excluding it");
-                            }
-                        }
-                    }
-                    Err(_) => {
-                        // If we can't parse the address, include it
+            for &server in upstream_servers {
+                // Find this server in the resolvers_by_speed list
+                if let Some((_, response_time)) =
+                    resolvers_by_speed.iter().find(|(a, _)| *a == server)
+                {
+                    // Check if this server is within the threshold
+                    if *response_time <= threshold {
                         eligible_servers.push(server);
                         debug!(
-                            "Failed to parse server address: {server}, including it as eligible"
+                            "Server {server} with response time {response_time}ms is eligible (threshold: {threshold}ms)"
+                        );
+                    } else {
+                        debug!(
+                            "Server {server} with response time {response_time}ms is too slow (threshold: {threshold}ms)"
                         );
                     }
+                } else if stats.get_resolver_stats(&server).is_none() {
+                    eligible_servers.push(server);
+                    debug!("Server {server} has no stats, including it as eligible");
+                } else {
+                    debug!("Server {server} has no successful probes, excluding it");
                 }
             }
 
@@ -185,7 +172,7 @@ async fn pick_upstream_server<'a>(
             if eligible_servers.is_empty() {
                 debug!("No eligible servers found, falling back to random selection");
                 let index = rng().random_range(0..upstream_servers.len());
-                return Some(&upstream_servers[index]);
+                return Some(upstream_servers[index]);
             }
 
             // If we have only one eligible server, return it
@@ -194,7 +181,6 @@ async fn pick_upstream_server<'a>(
                 return Some(eligible_servers[0]);
             }
 
-            // Get the global stats first (before using thread_rng)
             // We have at least two eligible servers, choose two randomly and pick the faster one
             let mut rng = rng();
 
@@ -208,34 +194,14 @@ async fn pick_upstream_server<'a>(
                 indices.swap(i, j);
             }
 
-            let index1 = indices[0];
-            let index2 = indices[1];
-
-            let server1 = eligible_servers[index1];
-            let server2 = eligible_servers[index2];
+            let server1 = eligible_servers[indices[0]];
+            let server2 = eligible_servers[indices[1]];
 
             debug!("P2 randomly selected servers: {server1} and {server2}");
 
-            // Parse the addresses
-            let addr1 = match server1.parse::<SocketAddr>() {
-                Ok(addr) => addr,
-                Err(_) => {
-                    debug!("Failed to parse server address: {server1}");
-                    return Some(server1);
-                }
-            };
-
-            let addr2 = match server2.parse::<SocketAddr>() {
-                Ok(addr) => addr,
-                Err(_) => {
-                    debug!("Failed to parse server address: {server2}");
-                    return Some(server2);
-                }
-            };
-
             // Get the stats for both servers
-            let stats1 = global_stats.get_resolver_stats(&addr1);
-            let stats2 = global_stats.get_resolver_stats(&addr2);
+            let stats1 = stats.get_resolver_stats(&server1);
+            let stats2 = stats.get_resolver_stats(&server2);
 
             // Compare the response times
             match (stats1, stats2) {
@@ -281,39 +247,35 @@ async fn pick_upstream_server<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stats::SharedStats;
+    use crate::stats::{PARK_AFTER_FAILURES, SharedStats};
     use std::time::Duration;
+
+    fn addrs(servers: &[&str]) -> Vec<SocketAddr> {
+        servers.iter().map(|s| s.parse().unwrap()).collect()
+    }
 
     #[tokio::test]
     async fn test_random_strategy() {
-        let upstream_servers = vec![
-            "127.0.0.1:53".to_string(),
-            "127.0.0.2:53".to_string(),
-            "127.0.0.3:53".to_string(),
-        ];
+        let upstream_servers = addrs(&["127.0.0.1:53", "127.0.0.2:53", "127.0.0.3:53"]);
 
         let server =
             select_upstream_server(&upstream_servers, LoadBalancingStrategy::Random, None).await;
 
         assert!(server.is_some());
-        assert!(upstream_servers.contains(server.unwrap()));
+        assert!(upstream_servers.contains(&server.unwrap()));
     }
 
     #[tokio::test]
     async fn test_fastest_strategy() {
-        let upstream_servers = vec![
-            "127.0.0.1:53".to_string(),
-            "127.0.0.2:53".to_string(),
-            "127.0.0.3:53".to_string(),
-        ];
+        let upstream_servers = addrs(&["127.0.0.1:53", "127.0.0.2:53", "127.0.0.3:53"]);
 
         // Create stats with 127.0.0.2:53 as the fastest
-        let stats = Arc::new(SharedStats::new());
+        let stats = SharedStats::new();
 
         // Add some stats
-        let addr1 = "127.0.0.1:53".parse::<SocketAddr>().unwrap();
-        let addr2 = "127.0.0.2:53".parse::<SocketAddr>().unwrap();
-        let addr3 = "127.0.0.3:53".parse::<SocketAddr>().unwrap();
+        let addr1 = upstream_servers[0];
+        let addr2 = upstream_servers[1];
+        let addr3 = upstream_servers[2];
 
         stats.record_success(addr1, Duration::from_millis(50)).await;
         stats.record_success(addr2, Duration::from_millis(10)).await; // Fastest
@@ -326,16 +288,15 @@ mod tests {
         )
         .await;
 
-        assert!(server.is_some());
-        assert_eq!(server.unwrap(), &"127.0.0.2:53".to_string());
+        assert_eq!(server, Some(addr2));
     }
 
     #[tokio::test]
     async fn test_failed_only_resolver_is_not_fastest() {
-        let upstream_servers = vec!["127.0.0.1:53".to_string(), "127.0.0.2:53".to_string()];
-        let stats = Arc::new(SharedStats::new());
-        let failed = upstream_servers[0].parse::<SocketAddr>().unwrap();
-        let healthy = upstream_servers[1].parse::<SocketAddr>().unwrap();
+        let upstream_servers = addrs(&["127.0.0.1:53", "127.0.0.2:53"]);
+        let stats = SharedStats::new();
+        let failed = upstream_servers[0];
+        let healthy = upstream_servers[1];
         stats.record_failure(failed).await;
         stats
             .record_success(healthy, Duration::from_millis(10))
@@ -354,30 +315,8 @@ mod tests {
         )
         .await;
 
-        assert_eq!(fastest, Some(&upstream_servers[1]));
-        assert_eq!(p2, Some(&upstream_servers[1]));
-    }
-
-    #[tokio::test]
-    async fn test_fastest_strategy_matches_non_canonical_addresses() {
-        let upstream_servers = vec![
-            "[2001:DB8::1]:53".to_string(),
-            "[2001:db8::2]:53".to_string(),
-        ];
-        let stats = Arc::new(SharedStats::new());
-        let fast = upstream_servers[0].parse::<SocketAddr>().unwrap();
-        let slow = upstream_servers[1].parse::<SocketAddr>().unwrap();
-        stats.record_success(fast, Duration::from_millis(10)).await;
-        stats.record_success(slow, Duration::from_millis(50)).await;
-
-        let server = select_upstream_server(
-            &upstream_servers,
-            LoadBalancingStrategy::Fastest,
-            Some(&stats),
-        )
-        .await;
-
-        assert_eq!(server, Some(&upstream_servers[0]));
+        assert_eq!(fastest, Some(healthy));
+        assert_eq!(p2, Some(healthy));
     }
 
     #[tokio::test]
@@ -391,21 +330,21 @@ mod tests {
         // For this test, we'll directly test the filtering logic
         // by creating a list of servers with specific response times
 
-        let upstream_servers = vec![
-            "127.0.0.1:53".to_string(), // Slow (50ms)
-            "127.0.0.2:53".to_string(), // Fastest (10ms)
-            "127.0.0.3:53".to_string(), // Too slow (30ms)
-            "127.0.0.4:53".to_string(), // Eligible (14ms)
-        ];
+        let upstream_servers = addrs(&[
+            "127.0.0.1:53", // Slow (50ms)
+            "127.0.0.2:53", // Fastest (10ms)
+            "127.0.0.3:53", // Too slow (30ms)
+            "127.0.0.4:53", // Eligible (14ms)
+        ]);
 
         // Create stats
-        let stats = Arc::new(SharedStats::new());
+        let stats = SharedStats::new();
 
         // Add some stats
-        let addr1 = "127.0.0.1:53".parse::<SocketAddr>().unwrap();
-        let addr2 = "127.0.0.2:53".parse::<SocketAddr>().unwrap();
-        let addr3 = "127.0.0.3:53".parse::<SocketAddr>().unwrap();
-        let addr4 = "127.0.0.4:53".parse::<SocketAddr>().unwrap();
+        let addr1 = upstream_servers[0];
+        let addr2 = upstream_servers[1];
+        let addr3 = upstream_servers[2];
+        let addr4 = upstream_servers[3];
 
         // Server 2 is the fastest (10ms)
         // Server 3 is 3x slower (30ms) - should be excluded (>50% slower)
@@ -419,7 +358,7 @@ mod tests {
         }
 
         // Print the resolvers by speed to debug
-        let resolvers_by_speed = stats.get_resolvers_by_speed().await;
+        let resolvers_by_speed = stats.lock().await.get_resolvers_by_speed(&upstream_servers);
         println!("Resolvers by speed:");
         for (addr, time) in &resolvers_by_speed {
             println!("  {} -> {}ms", addr, time);
@@ -440,11 +379,12 @@ mod tests {
         struct MockLoadBalancer;
 
         impl MockLoadBalancer {
-            async fn get_eligible_servers<'a>(
-                upstream_servers: &'a [String],
-                stats: &Arc<SharedStats>,
-            ) -> Vec<&'a String> {
-                let resolvers_by_speed = stats.get_resolvers_by_speed().await;
+            async fn get_eligible_servers(
+                upstream_servers: &[SocketAddr],
+                stats: &SharedStats,
+            ) -> Vec<SocketAddr> {
+                let resolvers_by_speed =
+                    stats.lock().await.get_resolvers_by_speed(upstream_servers);
 
                 if resolvers_by_speed.is_empty() {
                     return Vec::new();
@@ -453,24 +393,17 @@ mod tests {
                 let fastest_time = resolvers_by_speed[0].1;
                 let threshold = fastest_time * 1.5;
 
-                let mut eligible_servers: Vec<&String> = Vec::new();
+                let mut eligible_servers: Vec<SocketAddr> = Vec::new();
 
-                for server in upstream_servers {
-                    match server.parse::<SocketAddr>() {
-                        Ok(addr) => {
-                            if let Some((_, response_time)) =
-                                resolvers_by_speed.iter().find(|(a, _)| *a == addr)
-                            {
-                                if *response_time <= threshold {
-                                    eligible_servers.push(server);
-                                }
-                            } else {
-                                eligible_servers.push(server);
-                            }
-                        }
-                        Err(_) => {
+                for &server in upstream_servers {
+                    if let Some((_, response_time)) =
+                        resolvers_by_speed.iter().find(|(a, _)| *a == server)
+                    {
+                        if *response_time <= threshold {
                             eligible_servers.push(server);
                         }
+                    } else {
+                        eligible_servers.push(server);
                     }
                 }
 
@@ -490,8 +423,8 @@ mod tests {
 
         // Verify that only servers 2 and 4 are eligible
         assert_eq!(eligible_servers.len(), 2);
-        assert!(eligible_servers.contains(&&"127.0.0.2:53".to_string()));
-        assert!(eligible_servers.contains(&&"127.0.0.4:53".to_string()));
+        assert!(eligible_servers.contains(&addr2));
+        assert!(eligible_servers.contains(&addr4));
 
         // Now run the actual power-of-two-choices strategy multiple times
         // and verify that both eligible servers are selected at least once
@@ -510,11 +443,9 @@ mod tests {
             let selected = server.unwrap();
 
             // Only servers 2 and 4 should be selected (within 50% threshold)
-            assert!(
-                selected == &"127.0.0.2:53".to_string() || selected == &"127.0.0.4:53".to_string()
-            );
+            assert!(selected == addr2 || selected == addr4);
 
-            *selected_servers.entry(selected.clone()).or_insert(0) += 1;
+            *selected_servers.entry(selected).or_insert(0) += 1;
         }
 
         // Print the selection counts
@@ -524,24 +455,20 @@ mod tests {
         }
 
         // Verify that the fastest server is selected
-        assert!(selected_servers.contains_key("127.0.0.2:53"));
+        assert!(selected_servers.contains_key(&addr2));
     }
 
     #[tokio::test]
     async fn test_p2_strategy_one_eligible() {
-        let upstream_servers = vec![
-            "127.0.0.1:53".to_string(),
-            "127.0.0.2:53".to_string(),
-            "127.0.0.3:53".to_string(),
-        ];
+        let upstream_servers = addrs(&["127.0.0.1:53", "127.0.0.2:53", "127.0.0.3:53"]);
 
         // Create stats with 127.0.0.2:53 as the fastest
-        let stats = Arc::new(SharedStats::new());
+        let stats = SharedStats::new();
 
         // Add some stats
-        let addr1 = "127.0.0.1:53".parse::<SocketAddr>().unwrap();
-        let addr2 = "127.0.0.2:53".parse::<SocketAddr>().unwrap();
-        let addr3 = "127.0.0.3:53".parse::<SocketAddr>().unwrap();
+        let addr1 = upstream_servers[0];
+        let addr2 = upstream_servers[1];
+        let addr3 = upstream_servers[2];
 
         // Server 2 is the fastest (10ms)
         // Server 1 is 6x slower (60ms) - should be excluded (>50% slower)
@@ -559,10 +486,97 @@ mod tests {
             )
             .await;
 
-            assert!(server.is_some());
             // Only the fastest server should be selected since it's the only eligible one
-            assert_eq!(server.unwrap(), &"127.0.0.2:53".to_string());
+            assert_eq!(server, Some(addr2));
         }
+    }
+
+    #[tokio::test]
+    async fn test_parked_servers_are_avoided_by_every_strategy() {
+        let servers = addrs(&["192.0.2.1:53", "192.0.2.2:53", "192.0.2.3:53"]);
+        let (parked, healthy, excluded) = (servers[0], servers[1], servers[2]);
+        // The third server is not a candidate, for instance because of a recent failure
+        let candidates = [parked, healthy];
+        for strategy in [
+            LoadBalancingStrategy::Random,
+            LoadBalancingStrategy::Fastest,
+            LoadBalancingStrategy::PowerOfTwo,
+        ] {
+            let stats = SharedStats::new();
+            stats.record_success(parked, Duration::from_millis(1)).await;
+            stats
+                .record_success(healthy, Duration::from_millis(50))
+                .await;
+            stats
+                .record_success(excluded, Duration::from_millis(1))
+                .await;
+            for _ in 0..PARK_AFTER_FAILURES {
+                stats.record_timeout(parked).await;
+            }
+            for _ in 0..20 {
+                let server = select_upstream_server(&candidates, strategy, Some(&stats)).await;
+                assert_eq!(server, Some(healthy), "{strategy}");
+            }
+
+            // When every candidate is parked, one of them still gets the query
+            for _ in 0..PARK_AFTER_FAILURES {
+                stats.record_timeout(healthy).await;
+            }
+            for _ in 0..20 {
+                let server = select_upstream_server(&candidates, strategy, Some(&stats)).await;
+                assert!(candidates.contains(&server.unwrap()), "{strategy}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_p2_threshold_only_compares_candidates() {
+        let servers = addrs(&["192.0.2.1:53", "192.0.2.2:53", "192.0.2.3:53"]);
+        let (excluded, healthy, failing) = (servers[0], servers[1], servers[2]);
+        let stats = SharedStats::new();
+        stats
+            .record_success(excluded, Duration::from_millis(1))
+            .await;
+        stats
+            .record_success(healthy, Duration::from_millis(10))
+            .await;
+        stats.record_failure(failing).await;
+
+        // The fastest server is not a candidate, for instance because of a recent failure
+        let candidates = [healthy, failing];
+        for _ in 0..50 {
+            let server = select_upstream_server(
+                &candidates,
+                LoadBalancingStrategy::PowerOfTwo,
+                Some(&stats),
+            )
+            .await;
+            assert_eq!(server, Some(healthy));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_trial_is_reserved_when_the_server_is_picked() {
+        let servers = addrs(&["192.0.2.1:53", "192.0.2.2:53"]);
+        let (recovering, healthy) = (servers[0], servers[1]);
+        let stats = SharedStats::new();
+        stats
+            .record_success(recovering, Duration::from_millis(1))
+            .await;
+        stats
+            .record_success(healthy, Duration::from_millis(50))
+            .await;
+        for _ in 0..PARK_AFTER_FAILURES {
+            stats.record_timeout(recovering).await;
+        }
+
+        // Once the parking time is over, only the first query is a trial
+        tokio::time::advance(Duration::from_secs(60)).await;
+        let strategy = LoadBalancingStrategy::Fastest;
+        let first = select_upstream_server(&servers, strategy, Some(&stats)).await;
+        let second = select_upstream_server(&servers, strategy, Some(&stats)).await;
+
+        assert_eq!((first, second), (Some(recovering), Some(healthy)));
     }
 
     #[tokio::test]

@@ -28,6 +28,20 @@ pub const DNS_TYPE_RRSIG: u16 = 46;
 pub const DNS_TYPE_ANY: u16 = 255;
 
 #[cfg(test)]
+pub(crate) const EXAMPLE_COM_QUERY: &[u8] = &[
+    0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, b'e', b'x', b'a',
+    b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00, 0x00, 0x01, 0x00, 0x01,
+];
+
+/// Answers `EXAMPLE_COM_QUERY` with a 60-second TTL
+#[cfg(test)]
+pub(crate) const EXAMPLE_COM_ANSWER: &[u8] = &[
+    0x12, 0x34, 0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x07, b'e', b'x', b'a',
+    b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00, 0x00, 0x01, 0x00, 0x01, 0xc0, 0x0c, 0x00,
+    0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c, 0x00, 0x04, 192, 0, 2, 1,
+];
+
+#[cfg(test)]
 pub(crate) const NEGATIVE_RESPONSE_WITH_SOA_TTL_3600_MINIMUM_60: &[u8] = &[
     0x12, 0x34, 0x81, 0x83, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x07, b'e', b'x', b'a',
     b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00, 0x00, 0x01, 0x00, 0x01, 0xc0, 0x0c, 0x00,
@@ -1423,6 +1437,7 @@ pub fn add_edns_section(packet: &mut Vec<u8>, max_payload_size: u16) -> DnsResul
 /// - SOURCE PREFIX-LENGTH: Length of the prefix of the address to include
 /// - SCOPE PREFIX-LENGTH: Set to 0 in queries, indicates how much of the address was used in responses
 /// - ADDRESS: The truncated IP address (only including the prefix)
+#[allow(dead_code)]
 pub fn add_edns_client_subnet(
     packet: &mut Vec<u8>,
     client_ip: &str,
@@ -1437,6 +1452,36 @@ pub fn add_edns_client_subnet(
             debug!("Invalid client IP address for EDNS-client-subnet: {client_ip}");
             return Ok(()); // Silently ignore invalid IP addresses
         }
+    };
+
+    match ip_addr {
+        std::net::IpAddr::V4(_) if prefix_v4 > 32 => {
+            return Err(DnsError::InvalidEdns(format!(
+                "Invalid ECS prefix length {prefix_v4} for IPv4"
+            )));
+        }
+        std::net::IpAddr::V6(_) if prefix_v6 > 128 => {
+            return Err(DnsError::InvalidEdns(format!(
+                "Invalid ECS prefix length {prefix_v6} for IPv6"
+            )));
+        }
+        _ => {}
+    }
+
+    let ecs = EdnsClientSubnet::for_client(ip_addr, prefix_v4, prefix_v6);
+    set_edns_client_subnet(packet, Some(&ecs), max_payload_size)
+}
+
+/// Replaces the EDNS-client-subnet option of a DNS packet, or removes it with `None`.
+///
+/// If the packet has no OPT record, adding the option also adds one with the given maximum payload size.
+pub fn set_edns_client_subnet(
+    packet: &mut Vec<u8>,
+    ecs: Option<&EdnsClientSubnet>,
+    max_payload_size: u16,
+) -> DnsResult<()> {
+    let Some(ecs) = ecs else {
+        return remove_edns_option(packet, EDNS_OPTION_CLIENT_SUBNET);
     };
 
     // Determine if we need to add an OPT record first
@@ -1505,63 +1550,27 @@ pub fn add_edns_client_subnet(
     // Create the EDNS-client-subnet option
     let mut ecs_option = Vec::new();
 
-    // Determine family, source prefix length, and address bytes based on IP type
-    let (family, source_prefix_length, address_bytes) = match ip_addr {
-        std::net::IpAddr::V4(ipv4) => {
-            if prefix_v4 > 32 {
-                return Err(DnsError::InvalidEdns(format!(
-                    "Invalid ECS prefix length {prefix_v4} for IPv4"
-                )));
-            }
-            let bytes = ipv4.octets();
-            (1u16, prefix_v4, bytes.to_vec())
-        }
-        std::net::IpAddr::V6(ipv6) => {
-            if prefix_v6 > 128 {
-                return Err(DnsError::InvalidEdns(format!(
-                    "Invalid ECS prefix length {prefix_v6} for IPv6"
-                )));
-            }
-            let bytes = ipv6.octets();
-            (2u16, prefix_v6, bytes.to_vec())
-        }
-    };
-
-    // Calculate how many bytes we need to represent the prefix
-    let address_byte_count = (source_prefix_length as usize).div_ceil(8);
-
-    // Truncate the address bytes to the specified prefix length
-    let mut truncated_address = address_bytes[..address_byte_count].to_vec();
-
-    // If we're not using all bits in the last byte, mask it
-    if address_byte_count > 0 && source_prefix_length % 8 != 0 {
-        let last_byte_index = address_byte_count - 1;
-        let mask = 0xffu8 << (8 - (source_prefix_length % 8));
-        truncated_address[last_byte_index] &= mask;
-    }
-
     // Build the option
     // OPTION-CODE (CLIENT-SUBNET)
     ecs_option.push((EDNS_OPTION_CLIENT_SUBNET >> 8) as u8);
     ecs_option.push(EDNS_OPTION_CLIENT_SUBNET as u8);
 
     // OPTION-LENGTH
-    let option_length = 4 + truncated_address.len(); // 2 for family, 1 for source prefix length, 1 for scope prefix length, plus address bytes
+    let option_length = 4 + ecs.address.len(); // 2 for family, 1 for source prefix length, 1 for scope prefix length, plus address bytes
     ecs_option.push((option_length >> 8) as u8);
     ecs_option.push(option_length as u8);
 
     // FAMILY
-    ecs_option.push((family >> 8) as u8);
-    ecs_option.push(family as u8);
+    ecs_option.extend_from_slice(&ecs.family.to_be_bytes());
 
     // SOURCE PREFIX-LENGTH
-    ecs_option.push(source_prefix_length);
+    ecs_option.push(ecs.source_prefix_length);
 
-    // SCOPE PREFIX-LENGTH (always 0 in queries)
-    ecs_option.push(0);
+    // SCOPE PREFIX-LENGTH (0 in queries)
+    ecs_option.push(ecs.scope_prefix_length);
 
     // ADDRESS
-    ecs_option.extend_from_slice(&truncated_address);
+    ecs_option.extend_from_slice(&ecs.address);
 
     // Make sure the packet won't be too large
     if DNS_MAX_PACKET_SIZE.saturating_sub(packet.len()) < ecs_option.len() {
@@ -2841,6 +2850,28 @@ pub struct EdnsClientSubnet {
     pub scope_prefix_length: u8,
     /// IP address (truncated to the prefix length)
     pub address: Vec<u8>,
+}
+
+impl EdnsClientSubnet {
+    /// The subnet of a client address, as sent upstream
+    pub fn for_client(ip: std::net::IpAddr, prefix_v4: u8, prefix_v6: u8) -> Self {
+        let (family, prefix, mut address) = match ip {
+            std::net::IpAddr::V4(ip) => (1, prefix_v4, ip.octets().to_vec()),
+            std::net::IpAddr::V6(ip) => (2, prefix_v6, ip.octets().to_vec()),
+        };
+        address.truncate(usize::from(prefix).div_ceil(8));
+        if prefix % 8 != 0
+            && let Some(last) = address.last_mut()
+        {
+            *last &= 0xff << (8 - prefix % 8);
+        }
+        Self {
+            family,
+            source_prefix_length: prefix,
+            scope_prefix_length: 0,
+            address,
+        }
+    }
 }
 
 /// Removes every instance of an EDNS option, and keeps the other ones.

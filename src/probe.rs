@@ -281,7 +281,7 @@ mod tests {
                 stats.record_success(addr, response_time).await;
 
                 // Check that the stats were updated
-                let resolvers_by_speed = stats.get_resolvers_by_speed().await;
+                let resolvers_by_speed = stats.lock().await.get_resolvers_by_speed(&[addr]);
                 assert!(!resolvers_by_speed.is_empty());
             }
             Err(e) => {

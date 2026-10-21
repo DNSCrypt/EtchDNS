@@ -80,27 +80,10 @@ impl DNSKey {
 
     /// Replaces the ECS part of this key with the subnet sent upstream.
     pub fn set_client_subnet(&mut self, client_ip: &str, prefix_v4: u8, prefix_v6: u8) {
-        let Ok(ip) = client_ip.parse::<std::net::IpAddr>() else {
-            self.client_subnet = None;
-            return;
-        };
-        let (family, prefix, mut address) = match ip {
-            std::net::IpAddr::V4(ip) => (1, prefix_v4, ip.octets().to_vec()),
-            std::net::IpAddr::V6(ip) => (2, prefix_v6, ip.octets().to_vec()),
-        };
-        let address_len = usize::from(prefix).div_ceil(8);
-        address.truncate(address_len);
-        if prefix % 8 != 0
-            && let Some(last) = address.last_mut()
-        {
-            *last &= 0xff << (8 - prefix % 8);
-        }
-        self.client_subnet = Some(dns_parser::EdnsClientSubnet {
-            family,
-            source_prefix_length: prefix,
-            scope_prefix_length: 0,
-            address,
-        });
+        self.client_subnet = client_ip
+            .parse::<std::net::IpAddr>()
+            .ok()
+            .map(|ip| dns_parser::EdnsClientSubnet::for_client(ip, prefix_v4, prefix_v6));
     }
 
     /// Normalizes a domain name for consistent caching and comparison

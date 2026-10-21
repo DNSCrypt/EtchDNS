@@ -10,6 +10,7 @@ use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 
 use crate::cache::SyncDnsCache;
+use crate::failure_cache::FailureCache;
 use crate::stats::SharedStats;
 
 /// Response structure for API calls
@@ -28,6 +29,17 @@ struct CacheStatusResponse {
     hit_rate: f64,
     hits: u64,
     misses: u64,
+    /// None if failures are not remembered
+    failure_cache: Option<FailureCacheStatus>,
+}
+
+/// The failure cache, with sizes counted in queries
+#[derive(Serialize, Deserialize)]
+struct FailureCacheStatus {
+    size: usize,
+    capacity: usize,
+    /// Client queries answered without asking the upstream servers that failed them
+    hits: u64,
 }
 
 /// Check if a domain is within a zone
@@ -59,6 +71,7 @@ async fn handle_request(
     req: Request<hyper::body::Incoming>,
     control_path: String,
     dns_cache: Option<Arc<SyncDnsCache>>,
+    failure_cache: Option<FailureCache>,
     stats: Option<Arc<SharedStats>>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     let path = req.uri().path();
@@ -110,7 +123,7 @@ async fn handle_request(
                 let capacity = cache.capacity();
 
                 // Get cache hit/miss statistics from the stats system
-                let (hits, misses, hit_rate) = if let Some(stats_ref) = &stats {
+                let (hits, misses, hit_rate, failure_cache_hits) = if let Some(stats_ref) = &stats {
                     let global_stats = stats_ref.get_stats().await;
 
                     let hits = global_stats.cache_hits;
@@ -121,13 +134,13 @@ async fn handle_request(
                         0.0
                     };
 
-                    (hits, misses, hit_rate)
+                    (hits, misses, hit_rate, global_stats.failure_cache_hits)
                 } else {
                     // Fallback to placeholder values if stats not available
                     let hits = 0;
                     let misses = 0;
                     let hit_rate = 0.0;
-                    (hits, misses, hit_rate)
+                    (hits, misses, hit_rate, 0)
                 };
 
                 let response = CacheStatusResponse {
@@ -137,6 +150,11 @@ async fn handle_request(
                     hit_rate,
                     hits,
                     misses,
+                    failure_cache: failure_cache.map(|failure_cache| FailureCacheStatus {
+                        size: failure_cache.size(),
+                        capacity: failure_cache.capacity(),
+                        hits: failure_cache_hits,
+                    }),
                 };
                 let json = serde_json::to_string(&response).unwrap_or_else(|e| {
                     error!("Failed to serialize API response: {e}");
@@ -175,6 +193,9 @@ async fn handle_request(
             if let Some(cache) = dns_cache {
                 // Clear the cache
                 cache.clear();
+                if let Some(failure_cache) = &failure_cache {
+                    failure_cache.clear();
+                }
 
                 let cache_size = cache.len();
                 info!("DNS cache cleared, current size: {cache_size}");
@@ -255,6 +276,9 @@ async fn handle_request(
                     let new_size = inner.len();
                     (initial_size.saturating_sub(new_size), new_size)
                 });
+                if let Some(failure_cache) = &failure_cache {
+                    failure_cache.retain(|key| !is_domain_in_zone(&key.name, &normalized_zone));
+                }
 
                 info!("Cleared {removed_entries} entries for zone {zone} from DNS cache");
 
@@ -351,6 +375,9 @@ async fn handle_request(
                     let new_size = inner.len();
                     (initial_size.saturating_sub(new_size), new_size)
                 });
+                if let Some(failure_cache) = &failure_cache {
+                    failure_cache.retain(|key| key.name != normalized_name);
+                }
 
                 info!("Cleared {removed_entries} entries for name {name} from DNS cache");
 
@@ -420,6 +447,7 @@ pub async fn start_control_server(
     control_path: String,
     max_connections: usize,
     dns_cache: Option<Arc<SyncDnsCache>>,
+    failure_cache: Option<FailureCache>,
     stats: Option<Arc<SharedStats>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let addr = listener.local_addr()?;
@@ -446,6 +474,7 @@ pub async fn start_control_server(
         let control_path = control_path.clone();
         let semaphore = semaphore.clone();
         let dns_cache = dns_cache.clone();
+        let failure_cache = failure_cache.clone();
         let stats = stats.clone();
 
         // Spawn a task to handle the connection
@@ -466,8 +495,9 @@ pub async fn start_control_server(
             let service = hyper::service::service_fn(move |req| {
                 let control_path = control_path.clone();
                 let dns_cache = dns_cache.clone();
+                let failure_cache = failure_cache.clone();
                 let stats = stats.clone();
-                async move { handle_request(req, control_path, dns_cache, stats).await }
+                async move { handle_request(req, control_path, dns_cache, failure_cache, stats).await }
             });
 
             if let Ok(Err(err)) = tokio::time::timeout(
@@ -487,7 +517,76 @@ pub async fn start_control_server(
 
 #[cfg(test)]
 mod tests {
-    use super::is_domain_in_zone;
+    use super::*;
+    use crate::dns_key::DNSKey;
+    use crate::failure_cache::{FailureKind, FailurePolicy};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn request(addr: std::net::SocketAddr, method: &str, path: &str) -> String {
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let request =
+            format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        response
+    }
+
+    #[tokio::test]
+    async fn test_cache_deletion_forgets_failures() {
+        let upstream = "192.0.2.1:53".parse().unwrap();
+        let failure_cache =
+            FailureCache::new(FailurePolicy::default(), Arc::new([upstream])).unwrap();
+        let fail = |name: &str| {
+            let key = DNSKey::new(name.to_string(), 1, 1, false).unwrap();
+            failure_cache.record_failure(
+                &key,
+                upstream,
+                FailureKind::Timeout,
+                tokio::time::Instant::now(),
+            );
+        };
+        let names = |failure_cache: &FailureCache| {
+            let mut names = Vec::new();
+            failure_cache.retain(|key| {
+                names.push(key.name.clone());
+                true
+            });
+            names.sort();
+            names
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(start_control_server(
+            listener,
+            "/control".to_string(),
+            1,
+            Some(Arc::new(crate::cache::create_dns_cache(10))),
+            Some(failure_cache.clone()),
+            Some(Arc::new(SharedStats::new())),
+        ));
+        for name in [
+            "example.com",
+            "www.example.com",
+            "example.org",
+            "www.example.org",
+        ] {
+            fail(name);
+        }
+
+        let status = request(addr, "GET", "/control/cache").await;
+        assert!(
+            status.contains(r#""failure_cache":{"size":4,"capacity":1024,"hits":0}"#),
+            "{status}"
+        );
+
+        request(addr, "DELETE", "/control/cache/zone/example.com").await;
+        assert_eq!(names(&failure_cache), ["example.org", "www.example.org"]);
+        request(addr, "DELETE", "/control/cache/name/example.org").await;
+        assert_eq!(names(&failure_cache), ["www.example.org"]);
+        request(addr, "DELETE", "/control/cache").await;
+        assert!(names(&failure_cache).is_empty());
+    }
 
     #[test]
     fn zone_matching_normalizes_case_and_trailing_dots() {

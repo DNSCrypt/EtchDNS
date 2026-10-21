@@ -66,4 +66,5 @@ httpdate = "1.0.3"
 
 [dev-dependencies]
 tempfile = "3.27.0"
+tokio = { version = "1", features = ["test-util"] }
 tokio-test = "0.4.6"

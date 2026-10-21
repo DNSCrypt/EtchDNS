@@ -135,10 +135,6 @@ pub enum DnsError {
     #[error("Upstream DNS server timeout")]
     UpstreamTimeout,
 
-    /// Query is already in flight, contains a receiver for the response
-    #[error("Query is already in flight")]
-    AlreadyInFlight(tokio::sync::broadcast::Receiver<crate::query_manager::DnsResponse>),
-
     /// Other DNS-related errors
     #[error("Other DNS error: {0}")]
     Other(String),
@@ -171,30 +167,5 @@ impl From<String> for DnsError {
 impl From<&str> for DnsError {
     fn from(error: &str) -> Self {
         DnsError::Other(error.to_string())
-    }
-}
-
-impl DnsError {
-    /// Extracts the receiver from an AlreadyInFlight error
-    pub fn into_receiver(
-        self,
-    ) -> Option<tokio::sync::broadcast::Receiver<crate::query_manager::DnsResponse>> {
-        match self {
-            DnsError::AlreadyInFlight(receiver) => Some(receiver),
-            _ => None,
-        }
-    }
-}
-
-impl EtchDnsError {
-    /// Extracts the receiver from an AlreadyInFlight error in DnsProcessingError
-    #[allow(dead_code)]
-    pub fn into_receiver(
-        self,
-    ) -> Option<tokio::sync::broadcast::Receiver<crate::query_manager::DnsResponse>> {
-        match self {
-            EtchDnsError::DnsProcessingError(dns_error) => dns_error.into_receiver(),
-            _ => None,
-        }
     }
 }

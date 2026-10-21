@@ -3,7 +3,6 @@
 use async_trait::async_trait;
 use clap::Parser;
 use log::{debug, error, info, warn};
-use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::net::SocketAddr;
@@ -27,6 +26,7 @@ mod dns_parser;
 mod dns_processor;
 mod doh;
 mod errors;
+mod failure_cache;
 mod hooks;
 mod ip_validator;
 mod load_balancer;
@@ -43,7 +43,7 @@ mod stats;
 // Use our error types
 use connection_slots::{ClientSlots, ConnectionSlots};
 use dns_processor::DnsQueryProcessor;
-use errors::{DnsError, EtchDnsError, EtchDnsResult};
+use errors::{EtchDnsError, EtchDnsResult};
 use probe::probe_server;
 use query_manager::QueryManager;
 use stats::SharedStats;
@@ -234,6 +234,18 @@ struct Config {
     /// This is the minimum time a valid response will be stored in the cache (default: 1)
     #[serde(default = "default_min_cache_ttl")]
     min_cache_ttl: u32,
+
+    /// Number of queries whose upstream failures are remembered (0 to remember none)
+    #[serde(default = "default_failure_cache_size")]
+    failure_cache_size: usize,
+
+    /// Seconds before a server gets a query that it failed again, after the first failure
+    #[serde(default = "default_failure_backoff_min")]
+    failure_backoff_min: u64,
+
+    /// Each new failure doubles the delay, up to this number of seconds
+    #[serde(default = "default_failure_backoff_max")]
+    failure_backoff_max: u64,
 
     /// Path to a WebAssembly file containing hook implementations
     /// If set, the hooks will be loaded from this file
@@ -463,6 +475,18 @@ fn default_min_cache_ttl() -> u32 {
     1 // Default minimum TTL for cached responses is 1 second
 }
 
+fn default_failure_cache_size() -> usize {
+    failure_cache::DEFAULT_FAILURE_CACHE_SIZE
+}
+
+fn default_failure_backoff_min() -> u64 {
+    failure_cache::DEFAULT_FAILURE_BACKOFF_MIN
+}
+
+fn default_failure_backoff_max() -> u64 {
+    failure_cache::DEFAULT_FAILURE_BACKOFF_MAX
+}
+
 fn default_query_log_include_timestamp() -> bool {
     true // Include timestamp in query log by default
 }
@@ -686,6 +710,8 @@ impl Config {
             ));
         }
 
+        self.failure_policy()?;
+
         // Validate the load balancing strategy
         self.load_balancing_strategy
             .parse::<load_balancer::LoadBalancingStrategy>()
@@ -765,6 +791,16 @@ impl Config {
         Ok(())
     }
 
+    /// How long upstream servers are left alone after they failed a query
+    fn failure_policy(&self) -> EtchDnsResult<failure_cache::FailurePolicy> {
+        failure_cache::FailurePolicy::new(
+            self.failure_cache_size,
+            self.failure_backoff_min,
+            self.failure_backoff_max,
+        )
+        .map_err(EtchDnsError::Other)
+    }
+
     /// Parse the listen addresses into SocketAddr objects
     fn socket_addrs(&self) -> EtchDnsResult<Vec<SocketAddr>> {
         let mut addrs = Vec::new();
@@ -808,576 +844,6 @@ impl Config {
 
         Ok(addrs)
     }
-}
-
-/// Structure to handle client queries
-#[derive(Clone)]
-struct ClientQuery {
-    /// The data received from the client
-    data: Vec<u8>,
-    /// The upstream servers to forward the query to
-    upstream_servers: Vec<String>,
-    /// The server timeout in seconds
-    server_timeout: u64,
-    /// The maximum DNS packet size
-    dns_packet_len_max: usize,
-    /// The maximum UDP response size for this client
-    max_udp_response_size: usize,
-    /// Global statistics tracker
-    stats: Option<Arc<SharedStats>>,
-    /// Load balancing strategy
-    load_balancing_strategy: load_balancer::LoadBalancingStrategy,
-    /// Client IP address for EDNS-client-subnet
-    client_ip: Option<String>,
-    /// Whether EDNS-client-subnet is enabled
-    enable_ecs: bool,
-    /// IPv4 prefix length for EDNS-client-subnet
-    ecs_prefix_v4: u8,
-    /// IPv6 prefix length for EDNS-client-subnet
-    ecs_prefix_v6: u8,
-    /// Whether spoof protection is enabled
-    spoof_protection: bool,
-}
-
-impl ClientQuery {
-    /// Create a new ClientQuery with statistics tracking
-    fn new(
-        data: Vec<u8>,
-        upstream_servers: Vec<String>,
-        server_timeout: u64,
-        dns_packet_len_max: usize,
-        stats: Arc<SharedStats>,
-        load_balancing_strategy: load_balancer::LoadBalancingStrategy,
-    ) -> Self {
-        // Extract the EDNS0 maximum datagram size from the query, if present
-        let max_udp_response_size = match dns_parser::extract_edns0_max_size(&data) {
-            Ok(Some(size)) => usize::from(size).max(dns_parser::DNS_MAX_UDP_PACKET_SIZE),
-            _ => dns_parser::DNS_MAX_UDP_PACKET_SIZE,
-        };
-
-        Self {
-            data,
-            upstream_servers,
-            server_timeout,
-            dns_packet_len_max,
-            max_udp_response_size,
-            stats: Some(stats),
-            load_balancing_strategy,
-            client_ip: None,
-            enable_ecs: false, // Default to disabled, will be set by the caller
-            ecs_prefix_v4: default_ecs_prefix_v4(),
-            ecs_prefix_v6: default_ecs_prefix_v6(),
-            spoof_protection: true, // Default to enabled for security
-        }
-    }
-
-    /// Create a new ClientQuery with statistics tracking and client IP for EDNS-client-subnet
-    fn new_with_client_ip(
-        data: Vec<u8>,
-        upstream_servers: Vec<String>,
-        server_timeout: u64,
-        dns_packet_len_max: usize,
-        stats: Arc<SharedStats>,
-        load_balancing_strategy: load_balancer::LoadBalancingStrategy,
-        client_ip: String,
-        enable_ecs: bool,
-        ecs_prefix_v4: u8,
-        ecs_prefix_v6: u8,
-        spoof_protection: bool,
-    ) -> Self {
-        // Extract the EDNS0 maximum datagram size from the query, if present
-        let max_udp_response_size = match dns_parser::extract_edns0_max_size(&data) {
-            Ok(Some(size)) => usize::from(size).max(dns_parser::DNS_MAX_UDP_PACKET_SIZE),
-            _ => dns_parser::DNS_MAX_UDP_PACKET_SIZE,
-        };
-
-        Self {
-            data,
-            upstream_servers,
-            server_timeout,
-            dns_packet_len_max,
-            max_udp_response_size,
-            stats: Some(stats),
-            load_balancing_strategy,
-            client_ip: Some(client_ip),
-            enable_ecs,
-            ecs_prefix_v4,
-            ecs_prefix_v6,
-            spoof_protection,
-        }
-    }
-
-    /// Process the client query by forwarding it to an upstream DNS server
-    async fn process(&self) -> EtchDnsResult<Vec<u8>> {
-        // Log packet details at debug level
-        debug!("Processing query with data: {:?}", self.data);
-
-        // Validate that this is a valid DNS packet
-        if let Err(e) = dns_parser::validate_dns_packet(&self.data) {
-            // If validation fails, log the error and return without responding
-            debug!("Invalid DNS packet: {e}");
-            debug!("Dropping invalid DNS packet without response");
-            return Err(DnsError::InvalidPacket(format!("Invalid DNS packet: {e}")).into());
-        }
-
-        // Choose an upstream server based on the load balancing strategy
-        let upstream_server_str = self.select_upstream_server().await?;
-        debug!("Selected upstream server: {upstream_server_str}");
-
-        // Parse the upstream server address
-        let upstream_addr = upstream_server_str.parse::<SocketAddr>().map_err(|e| {
-            DnsError::UpstreamError(format!(
-                "Failed to parse upstream server address {upstream_server_str}: {e}"
-            ))
-        })?;
-
-        // Create a new UDP socket for the upstream connection
-        let bind_addr = if upstream_addr.is_ipv4() {
-            "0.0.0.0:0"
-        } else {
-            "[::]:0"
-        };
-        let upstream_socket = UdpSocket::bind(bind_addr).await.map_err(|e| {
-            DnsError::UpstreamError(format!(
-                "Failed to bind socket for upstream connection: {e}"
-            ))
-        })?;
-
-        // If we get here, the packet is valid
-        // Set EDNS0 with the configured maximum payload size
-        let mut query_data = self.data.clone();
-        if let Err(e) =
-            dns_parser::set_edns_max_payload_size(&mut query_data, self.dns_packet_len_max as u16)
-        {
-            error!("Failed to set EDNS maximum payload size: {e}");
-            debug!("Continuing with original query without EDNS");
-            query_data = self.data.clone(); // Revert to original query data
-        } else {
-            debug!(
-                "Set EDNS maximum payload size to {} bytes",
-                self.dns_packet_len_max
-            );
-
-            // Add EDNS-client-subnet if enabled and we have a client IP
-            if self.enable_ecs {
-                if let Some(client_ip) = &self.client_ip {
-                    match dns_parser::add_edns_client_subnet(
-                        &mut query_data,
-                        client_ip,
-                        self.ecs_prefix_v4,
-                        self.ecs_prefix_v6,
-                        self.dns_packet_len_max as u16,
-                    ) {
-                        Ok(_) => {
-                            debug!(
-                                "Added EDNS-client-subnet for client IP {} with prefix lengths IPv4:{}/IPv6:{}",
-                                client_ip, self.ecs_prefix_v4, self.ecs_prefix_v6
-                            );
-                        }
-                        Err(e) => {
-                            error!("Failed to add EDNS-client-subnet: {e}");
-                            debug!("Continuing without EDNS-client-subnet");
-                        }
-                    }
-                } else {
-                    debug!("EDNS-client-subnet is enabled but no client IP is available");
-                }
-            }
-        }
-
-        // Generate a random transaction ID
-        let random_tid: u16 = rand::rng().random();
-
-        // Store the original transaction ID for verification later
-        let original_tid = dns_parser::tid(&query_data);
-
-        // Replace the transaction ID in the query with the random one
-        if let Err(e) = dns_parser::set_tid(&mut query_data, random_tid) {
-            error!("Failed to set transaction ID: {e}");
-            return Err(
-                DnsError::InvalidPacket(format!("Failed to set transaction ID: {e}")).into(),
-            );
-        }
-
-        debug!("Replaced query transaction ID {original_tid} with random ID {random_tid}");
-
-        // Set the initial timeout to half of the server_timeout
-        let initial_timeout = std::cmp::max(1, self.server_timeout / 2);
-        debug!("Using initial timeout of {initial_timeout} seconds");
-
-        // Receive buffer
-        let mut buf = vec![0u8; self.dns_packet_len_max]; // Use the configured maximum DNS packet size
-
-        // Start timing the request
-        let start_time = std::time::Instant::now();
-
-        // First attempt
-        debug!("Sending query to upstream server (first attempt): {upstream_addr}");
-        upstream_socket
-            .send_to(&query_data, upstream_addr)
-            .await
-            .map_err(|e| {
-                DnsError::UpstreamError(format!(
-                    "Failed to send query to upstream server {upstream_addr}: {e}"
-                ))
-            })?;
-
-        // Wait for the response with the initial timeout
-        let initial_timeout_duration = tokio::time::Duration::from_secs(initial_timeout);
-        let recv_future = resolver::recv_from_peer(&upstream_socket, &mut buf, upstream_addr);
-
-        match tokio::time::timeout(initial_timeout_duration, recv_future).await {
-            Ok(Ok(len)) => {
-                // Successfully received a response within the initial timeout
-                let response_time = start_time.elapsed();
-                debug!(
-                    "Received response of size {len} bytes from upstream server (first attempt): {upstream_addr} in {response_time:?}"
-                );
-
-                let response = process_response(
-                    &buf[..len],
-                    random_tid,
-                    upstream_addr,
-                    self.spoof_protection,
-                    &query_data,
-                )
-                .await;
-
-                // Only a valid answer counts as a success.
-                // A bad one doesn't count as a failure either, since anyone could have faked it.
-                if response.is_ok()
-                    && let Some(stats) = &self.stats
-                {
-                    stats.record_success(upstream_addr, response_time).await;
-                }
-
-                response
-            }
-            Ok(Err(e)) => {
-                // Socket error
-                error!("Failed to receive response from upstream server {upstream_addr}: {e}");
-
-                if let Some(stats) = &self.stats {
-                    stats.record_failure(upstream_addr).await;
-                }
-
-                Err(DnsError::UpstreamError(format!(
-                    "Failed to receive response from upstream server {upstream_addr}: {e}"
-                ))
-                .into())
-            }
-            Err(_) => {
-                // Timeout occurred, try again
-                debug!(
-                    "Timeout waiting for response from upstream server after {initial_timeout} seconds (retrying): {upstream_addr}"
-                );
-
-                // Counted once per query, and before the retry, so that an answer to the retry
-                // can undo it.
-                if let Some(stats) = &self.stats {
-                    stats.record_timeout(upstream_addr).await;
-                }
-
-                // Second attempt
-                debug!("Sending query to upstream server (retry attempt): {upstream_addr}");
-                upstream_socket
-                    .send_to(&query_data, upstream_addr)
-                    .await
-                    .map_err(|e| {
-                        DnsError::UpstreamError(format!(
-                            "Failed to send retry query to upstream server {upstream_addr}: {e}"
-                        ))
-                    })?;
-
-                // Wait for the response with the remaining timeout
-                let remaining_timeout = self.server_timeout - initial_timeout;
-                let remaining_timeout_duration =
-                    tokio::time::Duration::from_secs(remaining_timeout);
-                let recv_future =
-                    resolver::recv_from_peer(&upstream_socket, &mut buf, upstream_addr);
-
-                match tokio::time::timeout(remaining_timeout_duration, recv_future).await {
-                    Ok(Ok(len)) => {
-                        // Successfully received a response on the retry
-                        debug!(
-                            "Received response of size {len} bytes from upstream server (retry attempt): {upstream_addr}"
-                        );
-
-                        // Process the response
-                        let response = process_response(
-                            &buf[..len],
-                            random_tid,
-                            upstream_addr,
-                            self.spoof_protection,
-                            &query_data,
-                        )
-                        .await;
-
-                        // The resolver is fine, but this delay is not a real response time
-                        if response.is_ok()
-                            && let Some(stats) = &self.stats
-                        {
-                            stats.clear_failures(upstream_addr).await;
-                        }
-
-                        response
-                    }
-                    Ok(Err(e)) => {
-                        // Socket error on retry
-                        error!(
-                            "Failed to receive response from upstream server on retry {upstream_addr}: {e}"
-                        );
-                        Err(DnsError::UpstreamError(format!(
-                            "Failed to receive response from upstream server on retry {upstream_addr}: {e}"
-                        ))
-                        .into())
-                    }
-                    Err(_) => {
-                        // Timeout on retry
-                        debug!(
-                            "Timeout waiting for response from upstream server on retry after {remaining_timeout} seconds: {upstream_addr}"
-                        );
-
-                        // Return timeout error after both attempts failed
-                        Err(DnsError::UpstreamTimeout.into())
-                    }
-                }
-            }
-        }
-    }
-
-    /// Select an upstream server based on the load balancing strategy
-    async fn select_upstream_server(&self) -> EtchDnsResult<String> {
-        let upstream_servers = &self.upstream_servers;
-        if upstream_servers.is_empty() {
-            return Err(
-                DnsError::UpstreamError("No upstream servers configured".to_string()).into(),
-            );
-        }
-
-        // Use the load balancer to select a server
-        load_balancer::select_upstream_server(
-            upstream_servers,
-            self.load_balancing_strategy,
-            self.stats.as_ref(),
-        )
-        .await
-        .map(|s| s.to_string()) // Convert &String to String
-        .ok_or_else(|| {
-            EtchDnsError::DnsProcessingError(DnsError::UpstreamError(
-                "Failed to select upstream server".to_string(),
-            ))
-        })
-    }
-}
-
-/// Process a DNS response
-async fn process_response(
-    response_data: &[u8],
-    expected_tid: u16,
-    upstream_addr: SocketAddr,
-    spoof_protection: bool,
-    query_data: &[u8],
-) -> EtchDnsResult<Vec<u8>> {
-    // Verify the transaction ID in the response
-    let response_tid = dns_parser::tid(response_data);
-    let should_fallback_to_tcp = if response_tid != expected_tid {
-        if spoof_protection {
-            // With spoof protection enabled, treat wrong transaction ID as truncated
-            // This will trigger TCP fallback using the existing mechanism
-            warn!(
-                "Potential DNS spoofing detected over UDP from {}: expected transaction ID {}, got {}. Will retry with TCP.",
-                upstream_addr, expected_tid, response_tid
-            );
-            true // Force TCP fallback
-        } else {
-            debug!("Transaction ID mismatch: expected {expected_tid}, got {response_tid}");
-            return Err(
-                DnsError::UpstreamError("Transaction ID mismatch in response".to_string()).into(),
-            );
-        }
-    } else {
-        debug!("Verified response transaction ID: {response_tid}");
-        false
-    };
-
-    // If spoof protection triggered TCP fallback, use the original query
-    // Otherwise validate the response
-    if !should_fallback_to_tcp {
-        // Validate that the response is a valid DNS response
-        if let Err(e) = dns_parser::validate_dns_response(response_data) {
-            debug!("Invalid DNS response: {e}");
-            return Err(DnsError::UpstreamError(format!("Invalid DNS response: {e}")).into());
-        }
-        if !dns_parser::questions_match(query_data, response_data)? {
-            return Err(
-                DnsError::UpstreamError("Question mismatch in UDP response".to_string()).into(),
-            );
-        }
-        if !dns_parser::edns_client_subnet_matches(query_data, response_data)? {
-            return Err(DnsError::UpstreamError("ECS mismatch in UDP response".to_string()).into());
-        }
-    }
-
-    // Check if the response is truncated (TC bit set) or if we need TCP fallback for spoof protection
-    if should_fallback_to_tcp || dns_parser::is_truncated(response_data) {
-        let reason = if should_fallback_to_tcp {
-            "potential spoofing detected"
-        } else {
-            "TC bit set"
-        };
-        debug!("Retrying with TCP ({reason})");
-
-        // Retry the query using TCP
-        match retry_with_tcp(query_data, expected_tid, upstream_addr).await {
-            Ok(tcp_response) => {
-                debug!("Successfully received complete response via TCP");
-                return Ok(tcp_response);
-            }
-            Err(e) => {
-                if should_fallback_to_tcp {
-                    warn!("Failed TCP retry after potential spoofing detected: {e}");
-                    return Err(e);
-                }
-
-                // Log the error but still return the truncated UDP response
-                // This is better than returning nothing
-                warn!(
-                    "Failed to get complete response via TCP: {e}, returning truncated UDP response"
-                );
-            }
-        }
-    }
-
-    Ok(response_data.to_vec())
-}
-
-/// Retry a DNS query using TCP when the UDP response is truncated
-async fn retry_with_tcp(
-    query_data: &[u8],
-    expected_tid: u16,
-    upstream_addr: SocketAddr,
-) -> EtchDnsResult<Vec<u8>> {
-    let tcp_query_data = query_data.to_vec();
-
-    // Create a TCP connection to the upstream server
-    debug!("Connecting to upstream DNS server via TCP: {upstream_addr}");
-    let mut tcp_stream = match tokio::net::TcpStream::connect(upstream_addr).await {
-        Ok(stream) => stream,
-        Err(e) => {
-            return Err(DnsError::UpstreamError(format!(
-                "Failed to connect to upstream server via TCP: {e}"
-            ))
-            .into());
-        }
-    };
-
-    // Prepare the DNS query for TCP (prepend 2-byte length)
-    let query_len = tcp_query_data.len() as u16;
-    let mut tcp_query = Vec::with_capacity(tcp_query_data.len() + 2);
-    tcp_query.push((query_len >> 8) as u8);
-    tcp_query.push(query_len as u8);
-    tcp_query.extend_from_slice(&tcp_query_data);
-
-    // Send the query
-    debug!("Sending DNS query via TCP to {upstream_addr}");
-    if let Err(e) = tcp_stream.write_all(&tcp_query).await {
-        return Err(
-            DnsError::UpstreamError(format!("Failed to send DNS query via TCP: {e}")).into(),
-        );
-    }
-
-    // Read the response length (2 bytes)
-    // Since this is only 2 bytes, we can use read_exact() here
-    // The risk of DoS is minimal for such a small read
-    let mut length_buf = [0u8; 2];
-    if let Err(e) = tcp_stream.read_exact(&mut length_buf).await {
-        return Err(DnsError::UpstreamError(format!(
-            "Failed to read DNS response length via TCP: {e}"
-        ))
-        .into());
-    }
-
-    // Calculate the response length
-    let response_len = ((length_buf[0] as usize) << 8) | (length_buf[1] as usize);
-    if !(dns_parser::DNS_PACKET_LEN_MIN..=dns_parser::DNS_MAX_PACKET_SIZE).contains(&response_len) {
-        return Err(DnsError::UpstreamError(format!(
-            "Invalid DNS response length via TCP: {response_len}"
-        ))
-        .into());
-    }
-
-    // Read the response using multiple read() calls to prevent DoS attacks
-    // where a malicious client sends one byte at a time
-    let mut response_buf = vec![0u8; response_len];
-    let mut total_bytes_read = 0;
-
-    // Define minimum read size (except for the last read)
-    let min_read_size = 512;
-
-    while total_bytes_read < response_len {
-        let bytes_remaining = response_len - total_bytes_read;
-
-        // Read into the appropriate slice of the buffer
-        let read_result = tcp_stream.read(&mut response_buf[total_bytes_read..]).await;
-
-        match read_result {
-            Ok(bytes_read) => {
-                if bytes_read == 0 {
-                    // Connection closed prematurely
-                    return Err(DnsError::UpstreamError(format!(
-                        "TCP connection closed unexpectedly after reading {total_bytes_read} of {response_len} bytes"
-                    ))
-                    .into());
-                }
-
-                // Check if we're getting small reads (potential DoS)
-                // Only enforce minimum read size if we're not near the end
-                if bytes_read < min_read_size && bytes_remaining > min_read_size {
-                    debug!(
-                        "Small TCP read detected ({bytes_read} bytes). This could be inefficient."
-                    );
-                }
-
-                total_bytes_read += bytes_read;
-                debug!("Read {bytes_read} bytes, total so far: {total_bytes_read}/{response_len}");
-            }
-            Err(e) => {
-                return Err(DnsError::UpstreamError(format!(
-                    "Failed to read DNS response via TCP after {total_bytes_read} of {response_len} bytes: {e}"
-                ))
-                .into());
-            }
-        }
-    }
-
-    // Verify the transaction ID in the response
-    let response_tid = dns_parser::tid(&response_buf);
-    if response_tid != expected_tid {
-        // TCP connections are inherently secure against spoofing due to the three-way handshake
-        // Transaction ID mismatches over TCP indicate a protocol error, not a spoofing attempt
-        debug!("TCP response transaction ID mismatch: expected {expected_tid}, got {response_tid}");
-        return Err(
-            DnsError::UpstreamError("Transaction ID mismatch in TCP response".to_string()).into(),
-        );
-    }
-
-    // Validate that the response is a valid DNS response
-    if let Err(e) = dns_parser::validate_dns_response(&response_buf) {
-        debug!("Invalid DNS TCP response: {e}");
-        return Err(DnsError::UpstreamError(format!("Invalid DNS TCP response: {e}")).into());
-    }
-    if !dns_parser::questions_match(&tcp_query_data, &response_buf)? {
-        return Err(
-            DnsError::UpstreamError("Question mismatch in TCP response".to_string()).into(),
-        );
-    }
-    if !dns_parser::edns_client_subnet_matches(&tcp_query_data, &response_buf)? {
-        return Err(DnsError::UpstreamError("ECS mismatch in TCP response".to_string()).into());
-    }
-
-    debug!("Successfully received DNS response via TCP, size: {response_len}");
-    Ok(response_buf)
 }
 
 async fn bind_tcp_listener(
@@ -1453,8 +919,11 @@ struct UDPClient {
     /// The client's address
     addr: SocketAddr,
 
-    /// The client query
-    query: ClientQuery,
+    /// The data received from the client
+    data: Vec<u8>,
+
+    /// The maximum UDP response size for this client
+    max_udp_response_size: usize,
 
     /// The query manager for aggregating identical DNS queries
     query_manager: Arc<QueryManager>,
@@ -1466,8 +935,8 @@ struct TCPClient {
     /// The client's address
     addr: SocketAddr,
 
-    /// The client query
-    query: ClientQuery,
+    /// The data received from the client
+    data: Vec<u8>,
 
     /// The query manager for aggregating identical DNS queries
     query_manager: Arc<QueryManager>,
@@ -1476,57 +945,27 @@ struct TCPClient {
     stream: Arc<Mutex<TcpStream>>,
 }
 
+/// The largest UDP response that the client accepts, from the EDNS0 size of its query
+fn max_udp_response_size(query: &[u8]) -> usize {
+    match dns_parser::extract_edns0_max_size(query) {
+        Ok(Some(size)) => usize::from(size).max(dns_parser::DNS_MAX_UDP_PACKET_SIZE),
+        _ => dns_parser::DNS_MAX_UDP_PACKET_SIZE,
+    }
+}
+
 impl UDPClient {
     /// Create a new UDPClient
     fn new(
         sender: Arc<UdpResponseSender>,
         data: Vec<u8>,
         addr: SocketAddr,
-        upstream_servers: Vec<String>,
         query_manager: Arc<QueryManager>,
     ) -> Self {
-        // Get the server_timeout and dns_packet_len_max from the query_manager
-        let server_timeout = query_manager.get_server_timeout();
-        let dns_packet_len_max = query_manager.get_dns_packet_len_max();
-
-        // Get the stats from the query manager
-        let stats = query_manager
-            .get_stats()
-            .expect("QueryManager should have stats");
-
-        // Get the load balancing strategy from the query manager
-        let load_balancing_strategy = query_manager.get_load_balancing_strategy();
-
-        // Get the ECS configuration from the query manager
-        let enable_ecs = query_manager.get_enable_ecs();
-        let ecs_prefix_v4 = query_manager.get_ecs_prefix_v4();
-        let ecs_prefix_v6 = query_manager.get_ecs_prefix_v6();
-
-        // Get the spoof protection configuration from the query manager
-        let spoof_protection = query_manager.get_spoof_protection();
-
-        // Extract client IP (without port) for EDNS-client-subnet
-        let client_ip = addr.ip().to_string();
-
-        // Create the client query with client IP for EDNS-client-subnet
-        let query = ClientQuery::new_with_client_ip(
-            data,
-            upstream_servers,
-            server_timeout,
-            dns_packet_len_max,
-            stats,
-            load_balancing_strategy,
-            client_ip,
-            enable_ecs,
-            ecs_prefix_v4,
-            ecs_prefix_v6,
-            spoof_protection,
-        );
-
         Self {
             sender,
             addr,
-            query,
+            max_udp_response_size: max_udp_response_size(&data),
+            data,
             query_manager,
         }
     }
@@ -1537,51 +976,12 @@ impl TCPClient {
     fn new(
         data: Vec<u8>,
         addr: SocketAddr,
-        upstream_servers: Vec<String>,
         query_manager: Arc<QueryManager>,
         stream: Arc<Mutex<TcpStream>>,
     ) -> Self {
-        // Get the server_timeout and dns_packet_len_max from the query_manager
-        let server_timeout = query_manager.get_server_timeout();
-        let dns_packet_len_max = query_manager.get_dns_packet_len_max();
-
-        // Get the stats from the query manager
-        let stats = query_manager
-            .get_stats()
-            .expect("QueryManager should have stats");
-
-        // Get the load balancing strategy from the query manager
-        let load_balancing_strategy = query_manager.get_load_balancing_strategy();
-
-        // Get the ECS configuration from the query manager
-        let enable_ecs = query_manager.get_enable_ecs();
-        let ecs_prefix_v4 = query_manager.get_ecs_prefix_v4();
-        let ecs_prefix_v6 = query_manager.get_ecs_prefix_v6();
-
-        // Get the spoof protection configuration from the query manager
-        let spoof_protection = query_manager.get_spoof_protection();
-
-        // Extract client IP (without port) for EDNS-client-subnet
-        let client_ip = addr.ip().to_string();
-
-        // Create the client query with client IP for EDNS-client-subnet
-        let query = ClientQuery::new_with_client_ip(
-            data,
-            upstream_servers,
-            server_timeout,
-            dns_packet_len_max,
-            stats,
-            load_balancing_strategy,
-            client_ip,
-            enable_ecs,
-            ecs_prefix_v4,
-            ecs_prefix_v6,
-            spoof_protection,
-        );
-
         Self {
             addr,
-            query,
+            data,
             query_manager,
             stream,
         }
@@ -1597,7 +997,6 @@ impl TCPClient {
 ///
 /// * `stream` - The TCP stream to read from and write to
 /// * `addr` - The client's address
-/// * `upstream_servers` - The upstream DNS servers to forward queries to
 /// * `query_manager` - The query manager for aggregating identical DNS queries
 /// * `dns_packet_len_max` - The maximum DNS packet size
 /// * `server_timeout` - The timeout for TCP connections in seconds
@@ -1608,7 +1007,6 @@ impl TCPClient {
 async fn process_tcp_connection(
     stream: TcpStream,
     addr: SocketAddr,
-    upstream_servers: Vec<String>,
     query_manager: Arc<QueryManager>,
     dns_packet_len_max: usize,
     server_timeout: u64,
@@ -1713,7 +1111,6 @@ async fn process_tcp_connection(
                                         let client = TCPClient::new(
                                             query_buf,
                                             addr,
-                                            upstream_servers.clone(),
                                             query_manager.clone(),
                                             stream_arc.clone(),
                                         );
@@ -1775,27 +1172,19 @@ impl Client for TCPClient {
         let client_addr = self.addr.to_string();
 
         // Create a future for the DNS query processing
-        let query_future = self.process_dns_query(
-            &self.query.data,
-            &client_addr,
-            "TCP",
-            &self.query_manager,
-            &self.query.upstream_servers,
-            self.query.server_timeout,
-            self.query.dns_packet_len_max,
-            self.query.stats.clone(),
-            self.query.load_balancing_strategy,
-        );
+        let query_future =
+            self.process_dns_query(&self.data, &client_addr, "TCP", &self.query_manager);
 
         // Apply a timeout of twice the server_timeout to the query future
-        let timeout_duration = std::time::Duration::from_secs(self.query.server_timeout * 2);
+        let server_timeout = self.query_manager.get_server_timeout();
+        let timeout_duration = std::time::Duration::from_secs(server_timeout * 2);
         let response_opt = match tokio::time::timeout(timeout_duration, query_future).await {
             Ok(response) => response,
             Err(_) => {
                 debug!(
                     "TCP query for client {} timed out after {} seconds",
                     self.addr,
-                    self.query.server_timeout * 2
+                    server_timeout * 2
                 );
                 None
             }
@@ -1811,7 +1200,7 @@ impl Client for TCPClient {
 
             // Send the response back to the client
             let mut stream = self.stream.lock().await;
-            let write_timeout = Duration::from_secs(self.query.server_timeout);
+            let write_timeout = Duration::from_secs(server_timeout);
             match tokio::time::timeout(write_timeout, stream.write_all(&tcp_response)).await {
                 Ok(Ok(_)) => {
                     debug!(
@@ -1848,27 +1237,19 @@ impl Client for UDPClient {
         let client_addr = self.addr.to_string();
 
         // Create a future for the DNS query processing
-        let query_future = self.process_dns_query(
-            &self.query.data,
-            &client_addr,
-            "UDP",
-            &self.query_manager,
-            &self.query.upstream_servers,
-            self.query.server_timeout,
-            self.query.dns_packet_len_max,
-            self.query.stats.clone(),
-            self.query.load_balancing_strategy,
-        );
+        let query_future =
+            self.process_dns_query(&self.data, &client_addr, "UDP", &self.query_manager);
 
         // Apply a timeout of twice the server_timeout to the query future
-        let timeout_duration = std::time::Duration::from_secs(self.query.server_timeout * 2);
+        let server_timeout = self.query_manager.get_server_timeout();
+        let timeout_duration = std::time::Duration::from_secs(server_timeout * 2);
         let response_opt = match tokio::time::timeout(timeout_duration, query_future).await {
             Ok(response) => response,
             Err(_) => {
                 debug!(
                     "UDP query for client {} timed out after {} seconds",
                     self.addr,
-                    self.query.server_timeout * 2
+                    server_timeout * 2
                 );
                 None
             }
@@ -1876,17 +1257,17 @@ impl Client for UDPClient {
 
         if let Some((mut response_data, _)) = response_opt {
             // Check if the response exceeds the maximum UDP response size
-            if response_data.len() > self.query.max_udp_response_size {
+            if response_data.len() > self.max_udp_response_size {
                 debug!(
                     "Response size ({} bytes) exceeds maximum UDP response size ({} bytes), truncating",
                     response_data.len(),
-                    self.query.max_udp_response_size
+                    self.max_udp_response_size
                 );
 
                 // Truncate the response
                 match dns_parser::truncate_dns_packet(
                     &response_data,
-                    Some(self.query.max_udp_response_size),
+                    Some(self.max_udp_response_size),
                     false,
                 ) {
                     Ok(truncated_data) => {
@@ -1958,6 +1339,14 @@ async fn main() -> EtchDnsResult<()> {
 
     // Log cache information
     info!("DNS cache size: {} entries", config.cache_size);
+    if config.failure_cache_size > 0 {
+        info!(
+            "Failure cache size: {} queries, retry delays from {} to {} seconds",
+            config.failure_cache_size, config.failure_backoff_min, config.failure_backoff_max
+        );
+    } else {
+        info!("Failure cache is disabled");
+    }
 
     // Log load balancing strategy
     info!(
@@ -2258,6 +1647,16 @@ async fn main() -> EtchDnsResult<()> {
         config.spoof_protection,
     );
 
+    query_manager.set_failure_policy(config.failure_policy()?);
+
+    let upstream_servers = config
+        .upstream_servers
+        .iter()
+        .map(|addr| addr.parse::<SocketAddr>())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| EtchDnsError::Other(format!("Invalid upstream socket address: {e}")))?;
+    query_manager.set_upstream_servers(upstream_servers);
+
     // Set the DNS cache in the query manager
     query_manager.set_cache((*dns_cache).clone());
 
@@ -2375,7 +1774,7 @@ async fn main() -> EtchDnsResult<()> {
         );
 
         // Clone the values we need for the prober
-        let upstream_servers = config.upstream_servers.clone();
+        let upstream_servers = query_manager.get_upstream_servers();
         let stats = global_stats.clone();
         let probe_interval = config.probe_interval;
         let server_timeout = config.server_timeout;
@@ -2392,28 +1791,20 @@ async fn main() -> EtchDnsResult<()> {
                 // Probe all servers
                 debug!("Probing all upstream DNS servers");
 
-                for server in &upstream_servers {
-                    // Parse the server address
-                    match server.parse::<SocketAddr>() {
-                        Ok(addr) => {
-                            // Probe the server
-                            match probe_server(addr, server_timeout).await {
-                                Ok(response_time) => {
-                                    debug!("Probe to {addr} completed in {response_time:.2?}");
+                for &addr in upstream_servers.iter() {
+                    // Probe the server
+                    match probe_server(addr, server_timeout).await {
+                        Ok(response_time) => {
+                            debug!("Probe to {addr} completed in {response_time:.2?}");
 
-                                    // Record the success in stats
-                                    stats.record_success(addr, response_time).await;
-                                }
-                                Err(e) => {
-                                    warn!("Probe to {addr} failed: {e}");
-
-                                    // Record the failure in stats
-                                    stats.record_failure(addr).await;
-                                }
-                            }
+                            // Record the success in stats
+                            stats.record_success(addr, response_time).await;
                         }
                         Err(e) => {
-                            error!("Failed to parse server address {server}: {e}");
+                            warn!("Probe to {addr} failed: {e}");
+
+                            // Record the failure in stats
+                            stats.record_failure(addr).await;
                         }
                     }
                 }
@@ -2461,22 +1852,10 @@ async fn main() -> EtchDnsResult<()> {
     for doh_listener in doh_listeners {
         // Clone the values we need for the DoH server
         let query_manager = query_manager.clone();
-        let upstream_servers = config.upstream_servers.clone();
         let server_timeout = config.server_timeout;
         let dns_packet_len_max = config.dns_packet_len_max;
-        let stats = global_stats.clone();
         let max_connections = config.max_doh_connections;
         let doh_rate_limiter = doh_rate_limiter.clone();
-        let load_balancing_strategy = config
-            .load_balancing_strategy
-            .parse::<load_balancer::LoadBalancingStrategy>()
-            .unwrap_or_else(|_| {
-                warn!(
-                    "Invalid load balancing strategy: {}, using fastest",
-                    config.load_balancing_strategy
-                );
-                load_balancer::LoadBalancingStrategy::Fastest
-            });
 
         // Clone the IP validator for this task
         let doh_ip_validator = ip_validator.clone();
@@ -2486,13 +1865,10 @@ async fn main() -> EtchDnsResult<()> {
             if let Err(e) = doh::start_doh_server(
                 doh_listener,
                 query_manager,
-                upstream_servers,
                 server_timeout,
                 dns_packet_len_max,
-                stats,
                 max_connections,
                 doh_rate_limiter,
-                load_balancing_strategy,
                 Some(doh_ip_validator),
                 config.enable_strict_ip_validation,
             )
@@ -2512,6 +1888,7 @@ async fn main() -> EtchDnsResult<()> {
         let control_path = config.control_path.clone();
         let max_connections = config.max_control_connections;
         let dns_cache = Some(dns_cache.clone());
+        let failure_cache = query_manager.get_failure_cache();
         let stats = Some(global_stats.clone());
 
         // Create a task for the control server
@@ -2521,6 +1898,7 @@ async fn main() -> EtchDnsResult<()> {
                 control_path,
                 max_connections,
                 dns_cache,
+                failure_cache,
                 stats,
             )
             .await
@@ -2534,7 +1912,6 @@ async fn main() -> EtchDnsResult<()> {
     }
 
     // Clone the configuration values we need for the tasks
-    let upstream_servers = config.upstream_servers.clone();
     let dns_packet_len_max = config.dns_packet_len_max;
 
     // Create a task for each UDP socket
@@ -2544,7 +1921,6 @@ async fn main() -> EtchDnsResult<()> {
         let all_socket_addrs = socket_addrs.clone();
         let socket_addr = (*all_socket_addrs)[i];
         let udp_clients = udp_clients.clone();
-        let upstream_servers = upstream_servers.clone();
         let query_manager = query_manager.clone();
         let udp_rate_limiter = udp_rate_limiter.clone();
         // Clone the ip validator for this task
@@ -2615,13 +1991,8 @@ async fn main() -> EtchDnsResult<()> {
                         debug!("Spawning new task to handle UDP client {addr}");
 
                         // Create a new UDPClient
-                        let client = UDPClient::new(
-                            response_sender,
-                            data,
-                            addr,
-                            upstream_servers.clone(),
-                            query_manager.clone(),
-                        );
+                        let client =
+                            UDPClient::new(response_sender, data, addr, query_manager.clone());
 
                         let task = async move {
                             debug!("Started processing task for UDP client {addr}");
@@ -2658,7 +2029,6 @@ async fn main() -> EtchDnsResult<()> {
         let all_socket_addrs = tcp_socket_addrs.clone();
         let socket_addr = (*all_socket_addrs)[i];
         let tcp_clients = tcp_clients.clone();
-        let upstream_servers = upstream_servers.clone();
         let query_manager = query_manager.clone();
         let tcp_rate_limiter = tcp_rate_limiter.clone();
 
@@ -2708,7 +2078,6 @@ async fn main() -> EtchDnsResult<()> {
                         }
 
                         // Clone the necessary values for the task
-                        let upstream_servers = upstream_servers.clone();
                         let query_manager = query_manager.clone();
                         let tcp_rate_limiter = tcp_rate_limiter.clone();
 
@@ -2717,7 +2086,6 @@ async fn main() -> EtchDnsResult<()> {
                             process_tcp_connection(
                                 stream,
                                 addr,
-                                upstream_servers,
                                 query_manager,
                                 dns_packet_len_max,
                                 server_timeout,
@@ -2834,6 +2202,18 @@ mod tests {
     }
 
     #[test]
+    fn test_failure_policy_defaults() {
+        let config: Config = toml::from_str("").unwrap();
+        assert_eq!(
+            config.failure_policy().unwrap(),
+            failure_cache::FailurePolicy::default()
+        );
+
+        let config: Config = toml::from_str("failure_cache_size = 0").unwrap();
+        assert_eq!(config.failure_policy().unwrap().cache_size, 0);
+    }
+
+    #[test]
     fn test_invalid_configuration_is_rejected() {
         assert!(toml::from_str::<Config>("unknown_setting = true").is_err());
 
@@ -2847,6 +2227,10 @@ mod tests {
 
         let mut config: Config = toml::from_str("").unwrap();
         config.blocked_ip_ranges = vec!["not a network".to_string()];
+        assert!(config.validate().is_err());
+
+        let mut config: Config = toml::from_str("").unwrap();
+        config.failure_backoff_min = 31;
         assert!(config.validate().is_err());
     }
 
@@ -2864,175 +2248,8 @@ mod tests {
     fn test_small_edns_udp_size_is_treated_as_512() {
         let mut packet = query();
         dns_parser::add_edns_section(&mut packet, 1).unwrap();
-        let query = ClientQuery::new(
-            packet,
-            vec!["127.0.0.1:53".to_string()],
-            1,
-            4096,
-            Arc::new(SharedStats::new()),
-            load_balancer::LoadBalancingStrategy::Random,
-        );
 
-        assert_eq!(query.max_udp_response_size, 512);
-    }
-
-    #[tokio::test]
-    async fn test_upstream_response_question_must_match() {
-        let query = query();
-        let mut response = query.clone();
-        dns_parser::set_qr(&mut response, true).unwrap();
-        let upstream = "127.0.0.1:53".parse().unwrap();
-
-        assert!(
-            process_response(&response, 0x1234, upstream, true, &query)
-                .await
-                .is_ok()
-        );
-
-        let qtype_offset = response.len() - 4;
-        response[qtype_offset..qtype_offset + 2].copy_from_slice(&[0, 28]);
-        assert!(
-            process_response(&response, 0x1234, upstream, true, &query)
-                .await
-                .is_err()
-        );
-    }
-
-    #[tokio::test]
-    async fn test_tcp_fallback_preserves_ecs() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let upstream = listener.local_addr().unwrap();
-        let mut query = query();
-        dns_parser::add_edns_section(&mut query, 1232).unwrap();
-        dns_parser::add_edns_client_subnet(&mut query, "192.0.2.129", 24, 56, 1232).unwrap();
-
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut length = [0u8; 2];
-            stream.read_exact(&mut length).await.unwrap();
-            let mut received = vec![0u8; u16::from_be_bytes(length) as usize];
-            stream.read_exact(&mut received).await.unwrap();
-            assert!(
-                dns_parser::extract_edns_client_subnet(&received)
-                    .unwrap()
-                    .is_some()
-            );
-            dns_parser::set_qr(&mut received, true).unwrap();
-            stream
-                .write_all(&(received.len() as u16).to_be_bytes())
-                .await
-                .unwrap();
-            stream.write_all(&received).await.unwrap();
-        });
-
-        let response = retry_with_tcp(&query, 0x1234, upstream).await.unwrap();
-        server.await.unwrap();
-        assert!(
-            dns_parser::extract_edns_client_subnet(&response)
-                .unwrap()
-                .is_some()
-        );
-    }
-
-    #[tokio::test]
-    async fn test_datagram_from_another_source_is_ignored() {
-        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let upstream_addr = upstream.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let mut packet = vec![0u8; 4096];
-            let (length, client) = upstream.recv_from(&mut packet).await.unwrap();
-            let stray = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-            stray.send_to(b"junk", client).await.unwrap();
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            packet.truncate(length);
-            dns_parser::set_qr(&mut packet, true).unwrap();
-            upstream.send_to(&packet, client).await.unwrap();
-        });
-        let client = ClientQuery::new(
-            query(),
-            vec![upstream_addr.to_string()],
-            2,
-            4096,
-            Arc::new(SharedStats::new()),
-            load_balancer::LoadBalancingStrategy::Random,
-        );
-
-        let response = client.process().await;
-        server.await.unwrap();
-
-        assert!(response.is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_answered_retry_clears_the_failure_streak() {
-        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let upstream_addr = upstream.local_addr().unwrap();
-        tokio::spawn(async move {
-            let mut packet = vec![0u8; 4096];
-            // Drop the first attempt of every query and answer its retry
-            for datagram in 1u64.. {
-                let Ok((length, client)) = upstream.recv_from(&mut packet).await else {
-                    break;
-                };
-                if datagram % 2 == 0 {
-                    let mut response = packet[..length].to_vec();
-                    dns_parser::set_qr(&mut response, true).unwrap();
-                    upstream.send_to(&response, client).await.unwrap();
-                }
-            }
-        });
-        let stats = Arc::new(SharedStats::new());
-
-        for _ in 0..2 {
-            let client = ClientQuery::new(
-                query(),
-                vec![upstream_addr.to_string()],
-                2,
-                4096,
-                stats.clone(),
-                load_balancer::LoadBalancingStrategy::Random,
-            );
-            assert!(client.process().await.is_ok());
-        }
-
-        let snapshot = stats.get_stats().await;
-        let resolver = snapshot.get_resolver_stats(&upstream_addr).unwrap();
-        assert_eq!(resolver.timeout_count, 2);
-        assert_eq!(resolver.consecutive_failures, 0);
-    }
-
-    #[tokio::test]
-    async fn test_invalid_answer_does_not_unpark_a_resolver() {
-        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let upstream_addr = upstream.local_addr().unwrap();
-        tokio::spawn(async move {
-            // Reply with the right ID, but for a different name
-            let mut packet = vec![0u8; 4096];
-            let (length, client) = upstream.recv_from(&mut packet).await.unwrap();
-            let mut response = packet[..length].to_vec();
-            dns_parser::set_qr(&mut response, true).unwrap();
-            response[13] = b'f';
-            upstream.send_to(&response, client).await.unwrap();
-        });
-        let stats = Arc::new(SharedStats::new());
-        for _ in 0..stats::PARK_AFTER_FAILURES {
-            stats.record_timeout(upstream_addr).await;
-        }
-
-        let client = ClientQuery::new(
-            query(),
-            vec![upstream_addr.to_string()],
-            2,
-            4096,
-            stats.clone(),
-            load_balancer::LoadBalancingStrategy::Random,
-        );
-        assert!(client.process().await.is_err());
-
-        let snapshot = stats.get_stats().await;
-        let resolver = snapshot.get_resolver_stats(&upstream_addr).unwrap();
-        assert_eq!(resolver.success_count, 0);
-        assert_eq!(resolver.consecutive_failures, stats::PARK_AFTER_FAILURES);
+        assert_eq!(max_udp_response_size(&packet), 512);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3069,12 +2286,13 @@ mod tests {
             .await
             .unwrap();
         let (server_stream, peer) = listener.accept().await.unwrap();
+        let mut query_manager = QueryManager::for_tests(1, 4096, true);
+        query_manager.set_upstream_servers(vec![upstream_addr]);
 
         let handler = tokio::spawn(process_tcp_connection(
             server_stream,
             peer,
-            vec![upstream_addr.to_string()],
-            Arc::new(QueryManager::for_tests(1, 4096, true)),
+            Arc::new(query_manager),
             4096,
             1,
             None,

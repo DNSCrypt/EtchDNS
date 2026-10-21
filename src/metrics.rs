@@ -27,6 +27,8 @@ fn format_metrics(
     active_tcp_clients: usize,
     cache_size: Option<usize>,
     cache_capacity: Option<usize>,
+    failure_cache_size: Option<usize>,
+    failure_cache_capacity: Option<usize>,
 ) -> String {
     let mut output = String::new();
 
@@ -59,11 +61,22 @@ fn format_metrics(
     output.push_str("# TYPE etchdns_failed_queries counter\n");
     output.push_str(&format!("etchdns_failed_queries {}\n", stats.total_failed));
 
-    output.push_str("# HELP etchdns_timeout_queries Total number of timed out DNS queries\n");
+    output.push_str(
+        "# HELP etchdns_timeout_queries Total number of upstream queries without an answer to their first datagram in time\n",
+    );
     output.push_str("# TYPE etchdns_timeout_queries counter\n");
     output.push_str(&format!(
         "etchdns_timeout_queries {}\n",
         stats.total_timeouts
+    ));
+
+    output.push_str(
+        "# HELP etchdns_upstream_budget_expirations Total number of upstream queries still unanswered at the end of server_timeout\n",
+    );
+    output.push_str("# TYPE etchdns_upstream_budget_expirations counter\n");
+    output.push_str(&format!(
+        "etchdns_upstream_budget_expirations {}\n",
+        stats.budget_expirations
     ));
 
     output.push_str("# HELP etchdns_client_queries Total number of client DNS queries received\n");
@@ -92,6 +105,31 @@ fn format_metrics(
         output.push_str("# HELP etchdns_cache_capacity Maximum capacity of the DNS cache\n");
         output.push_str("# TYPE etchdns_cache_capacity gauge\n");
         output.push_str(&format!("etchdns_cache_capacity {}\n", capacity));
+    }
+
+    output.push_str(
+        "# HELP etchdns_failure_cache_hits Total number of client queries answered without asking, because every upstream server failed them recently\n",
+    );
+    output.push_str("# TYPE etchdns_failure_cache_hits counter\n");
+    output.push_str(&format!(
+        "etchdns_failure_cache_hits {}\n",
+        stats.failure_cache_hits
+    ));
+
+    if let Some(size) = failure_cache_size {
+        output.push_str(
+            "# HELP etchdns_failure_cache_size Current number of queries with recent upstream failures\n",
+        );
+        output.push_str("# TYPE etchdns_failure_cache_size gauge\n");
+        output.push_str(&format!("etchdns_failure_cache_size {}\n", size));
+    }
+
+    if let Some(capacity) = failure_cache_capacity {
+        output.push_str(
+            "# HELP etchdns_failure_cache_capacity Maximum number of queries with recent upstream failures\n",
+        );
+        output.push_str("# TYPE etchdns_failure_cache_capacity gauge\n");
+        output.push_str(&format!("etchdns_failure_cache_capacity {}\n", capacity));
     }
 
     // Calculate and output cache hit rate if we have both hits and misses
@@ -207,6 +245,11 @@ fn format_metrics(
     );
     output.push_str("# TYPE etchdns_resolver_timeout_count counter\n");
 
+    output.push_str(
+        "# HELP etchdns_resolver_budget_expiration_count Number of queries still unanswered at the end of server_timeout per resolver\n",
+    );
+    output.push_str("# TYPE etchdns_resolver_budget_expiration_count counter\n");
+
     output.push_str("# HELP etchdns_resolver_last_used_timestamp Last time the resolver was used (Unix timestamp)\n");
     output.push_str("# TYPE etchdns_resolver_last_used_timestamp gauge\n");
 
@@ -232,6 +275,11 @@ fn format_metrics(
         output.push_str(&format!(
             "etchdns_resolver_timeout_count{{resolver=\"{}\"}} {}\n",
             addr_str, stats.timeout_count
+        ));
+
+        output.push_str(&format!(
+            "etchdns_resolver_budget_expiration_count{{resolver=\"{}\"}} {}\n",
+            addr_str, stats.budget_expiration_count
         ));
 
         // Calculate resolver error ratio
@@ -290,6 +338,11 @@ async fn handle_request(
             Some(cache) => (Some(cache.len()), Some(cache.capacity())),
             None => (None, None),
         };
+        let failure_cache = query_manager.as_ref().and_then(|qm| qm.get_failure_cache());
+        let (failure_cache_size, failure_cache_capacity) = match &failure_cache {
+            Some(failure_cache) => (Some(failure_cache.size()), Some(failure_cache.capacity())),
+            None => (None, None),
+        };
 
         // Format the metrics
         let metrics_text = format_metrics(
@@ -299,6 +352,8 @@ async fn handle_request(
             active_tcp_clients,
             cache_size,
             cache_capacity,
+            failure_cache_size,
+            failure_cache_capacity,
         );
 
         // Return the metrics
@@ -412,5 +467,28 @@ mod tests {
         // Runs until the server waits for its first connection
         assert!(futures::FutureExt::now_or_never(server).is_none());
         assert!(START_TIME.get().is_some());
+    }
+
+    #[test]
+    fn test_failure_metrics_are_exported() {
+        let mut stats = GlobalStats::new();
+        let resolver = "192.0.2.1:53".parse().unwrap();
+        stats.record_timeout(resolver);
+        stats.record_budget_expiration(resolver);
+        stats.record_failure_cache_hit();
+
+        let metrics = format_metrics(&stats, 0, 0, 0, None, None, Some(3), Some(1024));
+
+        for line in [
+            "etchdns_timeout_queries 1",
+            "etchdns_upstream_budget_expirations 1",
+            "etchdns_failure_cache_hits 1",
+            "etchdns_failure_cache_size 3",
+            "etchdns_failure_cache_capacity 1024",
+            "etchdns_resolver_timeout_count{resolver=\"192.0.2.1_53\"} 1",
+            "etchdns_resolver_budget_expiration_count{resolver=\"192.0.2.1_53\"} 1",
+        ] {
+            assert!(metrics.lines().any(|l| l == line), "{line}");
+        }
     }
 }

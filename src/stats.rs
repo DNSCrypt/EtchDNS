@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
-use tokio::sync::Mutex;
+use std::time::{Duration, SystemTime};
+use tokio::sync::{Mutex, MutexGuard};
+use tokio::time::Instant;
 
 /// Unanswered queries in a row before a resolver is parked.
 ///
@@ -35,6 +36,8 @@ pub struct ResolverStats {
     pub failure_count: u64,
     /// Number of timed out queries
     pub timeout_count: u64,
+    /// Attempts that ran out of time after a query was sent
+    pub budget_expiration_count: u64,
     /// Failures and timeouts since the resolver last answered
     pub consecutive_failures: u64,
     /// Last time this resolver was used
@@ -54,6 +57,7 @@ impl ResolverStats {
             success_count: 0,
             failure_count: 0,
             timeout_count: 0,
+            budget_expiration_count: 0,
             consecutive_failures: 0,
             last_used: SystemTime::now(),
             weight_factor: 0.2, // 20% weight to new values
@@ -139,12 +143,16 @@ pub struct GlobalStats {
     pub total_failed: u64,
     /// Total number of timed out queries
     pub total_timeouts: u64,
+    /// Attempts that ran out of time after a query was sent
+    pub budget_expirations: u64,
     /// Total number of client queries received
     pub client_queries: u64,
     /// Total number of cache hits
     pub cache_hits: u64,
     /// Total number of cache misses
     pub cache_misses: u64,
+    /// Client queries answered without asking the upstream servers that failed them
+    pub failure_cache_hits: u64,
     /// Count of UDP receive errors
     pub udp_receive_errors: u64,
     /// Count of TCP accept errors
@@ -161,9 +169,11 @@ impl GlobalStats {
             total_successful: 0,
             total_failed: 0,
             total_timeouts: 0,
+            budget_expirations: 0,
             client_queries: 0,
             cache_hits: 0,
             cache_misses: 0,
+            failure_cache_hits: 0,
             udp_receive_errors: 0,
             tcp_accept_errors: 0,
             resolver_stats: HashMap::new(),
@@ -204,6 +214,22 @@ impl GlobalStats {
         }
     }
 
+    /// Record an attempt that ran out of time after its query was sent.
+    ///
+    /// The first unanswered query already counts as a timeout, so this is not one more failure.
+    pub fn record_budget_expiration(&mut self, resolver: SocketAddr) {
+        self.budget_expirations = self.budget_expirations.saturating_add(1);
+        let stats = self.resolver_stats.entry(resolver).or_default();
+        stats.budget_expiration_count = stats.budget_expiration_count.saturating_add(1);
+    }
+
+    /// Checks whether a resolver is parked after too many failures
+    pub fn is_parked(&self, resolver: &SocketAddr) -> bool {
+        self.resolver_stats
+            .get(resolver)
+            .is_some_and(ResolverStats::is_parked)
+    }
+
     /// Record that a query is about to be sent to a resolver.
     ///
     /// If the resolver's parking time is over, this query is a trial.
@@ -234,6 +260,11 @@ impl GlobalStats {
         self.cache_misses = self.cache_misses.saturating_add(1);
     }
 
+    /// Record a query answered without asking the upstream servers that failed it
+    pub fn record_failure_cache_hit(&mut self) {
+        self.failure_cache_hits = self.failure_cache_hits.saturating_add(1);
+    }
+
     /// Increment the UDP receive errors counter
     pub fn increment_udp_receive_errors(&mut self) {
         self.udp_receive_errors = self.udp_receive_errors.saturating_add(1);
@@ -244,15 +275,15 @@ impl GlobalStats {
         self.tcp_accept_errors = self.tcp_accept_errors.saturating_add(1);
     }
 
-    /// Get a list of resolvers sorted by response time (fastest first)
+    /// Sorts the given resolvers by response time (fastest first)
     ///
-    /// Resolvers that keep failing are left out for a while.
-    pub fn get_resolvers_by_speed(&self) -> Vec<(SocketAddr, f64)> {
-        let mut resolvers: Vec<(SocketAddr, f64)> = self
-            .resolver_stats
+    /// Resolvers without an answer yet are left out, and so are the ones that keep failing.
+    pub fn get_resolvers_by_speed(&self, among: &[SocketAddr]) -> Vec<(SocketAddr, f64)> {
+        let mut resolvers: Vec<(SocketAddr, f64)> = among
             .iter()
+            .filter_map(|addr| Some((*addr, self.resolver_stats.get(addr)?)))
             .filter(|(_, stats)| stats.success_count > 0 && !stats.is_parked())
-            .map(|(addr, stats)| (*addr, stats.avg_response_time_ms))
+            .map(|(addr, stats)| (addr, stats.avg_response_time_ms))
             .collect();
 
         // Sort by response time (ascending)
@@ -315,10 +346,15 @@ impl SharedStats {
         stats.clear_failures(resolver);
     }
 
-    /// Record that a query is about to be sent to a resolver
-    pub async fn record_query_sent(&self, resolver: SocketAddr) {
+    /// Record an attempt that ran out of time after its query was sent
+    pub async fn record_budget_expiration(&self, resolver: SocketAddr) {
         let mut stats = self.inner.lock().await;
-        stats.record_query_sent(resolver);
+        stats.record_budget_expiration(resolver);
+    }
+
+    /// Locks the stats, for changes that must happen together
+    pub async fn lock(&self) -> MutexGuard<'_, GlobalStats> {
+        self.inner.lock().await
     }
 
     /// Get a snapshot of the global stats
@@ -345,10 +381,10 @@ impl SharedStats {
         stats.record_cache_miss();
     }
 
-    /// Get a list of resolvers sorted by response time (fastest first)
-    pub async fn get_resolvers_by_speed(&self) -> Vec<(SocketAddr, f64)> {
-        let stats = self.inner.lock().await;
-        stats.get_resolvers_by_speed()
+    /// Record a query answered without asking the upstream servers that failed it
+    pub async fn record_failure_cache_hit(&self) {
+        let mut stats = self.inner.lock().await;
+        stats.record_failure_cache_hit();
     }
 
     /// Checks whether every resolver missed enough queries in a row to be considered down
@@ -438,24 +474,25 @@ mod tests {
         stats.record_success(fast, Duration::from_millis(10));
         stats.record_success(slow, Duration::from_millis(50));
         let without_fast = vec![(slow, 50.0)];
+        let both = [fast, slow];
 
         for _ in 1..PARK_AFTER_FAILURES {
             stats.record_timeout(fast);
         }
-        assert_eq!(stats.get_resolvers_by_speed().len(), 2);
+        assert_eq!(stats.get_resolvers_by_speed(&both).len(), 2);
         stats.record_timeout(fast);
-        assert_eq!(stats.get_resolvers_by_speed(), without_fast);
+        assert_eq!(stats.get_resolvers_by_speed(&both), without_fast);
 
         // When the time is up, it gets one trial query, not all of them
         stats.resolver_stats.get_mut(&fast).unwrap().parked_until = Some(Instant::now());
-        assert_eq!(stats.get_resolvers_by_speed().len(), 2);
+        assert_eq!(stats.get_resolvers_by_speed(&both).len(), 2);
         stats.record_query_sent(slow);
-        assert_eq!(stats.get_resolvers_by_speed().len(), 2);
+        assert_eq!(stats.get_resolvers_by_speed(&both).len(), 2);
         stats.record_query_sent(fast);
-        assert_eq!(stats.get_resolvers_by_speed(), without_fast);
+        assert_eq!(stats.get_resolvers_by_speed(&both), without_fast);
 
         stats.record_success(fast, Duration::from_millis(10));
-        assert_eq!(stats.get_resolvers_by_speed().len(), 2);
+        assert_eq!(stats.get_resolvers_by_speed(&both).len(), 2);
 
         // Each failed trial doubles the wait
         assert_eq!(park_duration(PARK_AFTER_FAILURES), MIN_PARK_DURATION);

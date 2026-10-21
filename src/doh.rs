@@ -1,6 +1,5 @@
 use crate::dns_processor::DnsQueryProcessor;
-use crate::query_manager::QueryManager;
-use crate::stats::SharedStats;
+use crate::query_manager::{FailureFreshness, QueryManager};
 use base64::{Engine as _, engine::general_purpose};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
@@ -22,28 +21,15 @@ use tokio::sync::Semaphore;
 async fn handle_doh_request(
     req: Request<hyper::body::Incoming>,
     query_manager: Arc<QueryManager>,
-    upstream_servers: Vec<String>,
     server_timeout: u64,
     dns_packet_len_max: usize,
-    stats: Arc<SharedStats>,
-    load_balancing_strategy: crate::load_balancer::LoadBalancingStrategy,
     client_addr: SocketAddr,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     // Check the request method
     match *req.method() {
         // Handle GET requests
         Method::GET => {
-            handle_doh_get_request(
-                req,
-                query_manager,
-                upstream_servers,
-                server_timeout,
-                dns_packet_len_max,
-                stats,
-                load_balancing_strategy,
-                client_addr,
-            )
-            .await
+            handle_doh_get_request(req, query_manager, dns_packet_len_max, client_addr).await
         }
 
         // Handle POST requests
@@ -51,11 +37,8 @@ async fn handle_doh_request(
             handle_doh_post_request(
                 req,
                 query_manager,
-                upstream_servers,
                 server_timeout,
                 dns_packet_len_max,
-                stats,
-                load_balancing_strategy,
                 client_addr,
             )
             .await
@@ -76,11 +59,7 @@ async fn handle_doh_request(
 async fn handle_doh_get_request(
     req: Request<hyper::body::Incoming>,
     query_manager: Arc<QueryManager>,
-    upstream_servers: Vec<String>,
-    server_timeout: u64,
     dns_packet_len_max: usize,
-    stats: Arc<SharedStats>,
-    load_balancing_strategy: crate::load_balancer::LoadBalancingStrategy,
     client_addr: SocketAddr,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     // Extract the 'dns' query parameter
@@ -107,17 +86,7 @@ async fn handle_doh_get_request(
                         ));
                     }
                     // Process the DNS message
-                    process_dns_message(
-                        dns_message,
-                        query_manager,
-                        upstream_servers,
-                        server_timeout,
-                        dns_packet_len_max,
-                        stats,
-                        load_balancing_strategy,
-                        &client_addr,
-                    )
-                    .await
+                    process_dns_message(dns_message, query_manager, &client_addr).await
                 }
                 Err(e) => {
                     error!("Failed to decode base64url DNS message: {e}");
@@ -142,11 +111,8 @@ async fn handle_doh_get_request(
 async fn handle_doh_post_request(
     req: Request<hyper::body::Incoming>,
     query_manager: Arc<QueryManager>,
-    upstream_servers: Vec<String>,
     server_timeout: u64,
     dns_packet_len_max: usize,
-    stats: Arc<SharedStats>,
-    load_balancing_strategy: crate::load_balancer::LoadBalancingStrategy,
     client_addr: SocketAddr,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     // Check the Content-Type header
@@ -166,17 +132,7 @@ async fn handle_doh_post_request(
             )),
             Ok(Ok(bytes)) => {
                 // Process the DNS message
-                process_dns_message(
-                    bytes.to_bytes().to_vec(),
-                    query_manager,
-                    upstream_servers,
-                    server_timeout,
-                    dns_packet_len_max,
-                    stats,
-                    load_balancing_strategy,
-                    &client_addr,
-                )
-                .await
+                process_dns_message(bytes.to_bytes().to_vec(), query_manager, &client_addr).await
             }
             Ok(Err(e)) if e.downcast_ref::<LengthLimitError>().is_some() => {
                 Ok(create_error_response(
@@ -223,11 +179,6 @@ impl DnsQueryProcessor for DoHHandler {}
 async fn process_dns_message(
     dns_message: Vec<u8>,
     query_manager: Arc<QueryManager>,
-    upstream_servers: Vec<String>,
-    server_timeout: u64,
-    dns_packet_len_max: usize,
-    stats: Arc<SharedStats>,
-    load_balancing_strategy: crate::load_balancer::LoadBalancingStrategy,
     client_addr: &SocketAddr,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     // Create a DoH handler
@@ -236,23 +187,13 @@ async fn process_dns_message(
     // Process the DNS query using the DnsQueryProcessor trait
     let client_addr_str = client_addr.to_string();
     let result = handler
-        .process_dns_query(
-            &dns_message,
-            &client_addr_str,
-            "DoH",
-            &query_manager,
-            &upstream_servers,
-            server_timeout,
-            dns_packet_len_max,
-            Some(stats),
-            load_balancing_strategy,
-        )
+        .process_dns_query(&dns_message, &client_addr_str, "DoH", &query_manager)
         .await;
 
     match result {
-        Some((response_data, _)) => {
+        Some((response_data, failure_freshness)) => {
             // Create and return a successful response
-            Ok(create_dns_response(&response_data))
+            Ok(create_dns_response(&response_data, failure_freshness))
         }
         None => {
             // Error already logged in process_dns_query
@@ -265,7 +206,10 @@ async fn process_dns_message(
 }
 
 /// Create a successful HTTP response with DNS message and headers
-fn create_dns_response(response_data: &[u8]) -> Response<Full<Bytes>> {
+fn create_dns_response(
+    response_data: &[u8],
+    failure_freshness: Option<FailureFreshness>,
+) -> Response<Full<Bytes>> {
     // Create a response with the DNS message
     let mut http_response = Response::new(Full::new(Bytes::from(response_data.to_vec())));
     http_response.headers_mut().insert(
@@ -273,19 +217,31 @@ fn create_dns_response(response_data: &[u8]) -> Response<Full<Bytes>> {
         header::HeaderValue::from_static("application/dns-message"),
     );
 
-    add_cache_headers(&mut http_response, response_data);
+    add_cache_headers(&mut http_response, response_data, failure_freshness);
 
     http_response
 }
 
 /// Keeps the HTTP cache within the DNS TTL limits required by RFC 8484.
-fn add_cache_headers(response: &mut Response<Full<Bytes>>, dns_data: &[u8]) {
-    let cache_ttl = crate::dns_parser::extract_cache_ttl(dns_data)
-        .ok()
-        .flatten()
-        .unwrap_or(0);
+///
+/// A SERVFAIL has its own limit, see `failure_cache_ttl()`.
+fn add_cache_headers(
+    response: &mut Response<Full<Bytes>>,
+    dns_data: &[u8],
+    failure_freshness: Option<FailureFreshness>,
+) {
+    let (scope, cache_ttl) =
+        if crate::dns_parser::rcode(dns_data) == crate::dns_processor::DNS_RCODE_SERVFAIL {
+            failure_cache_ttl(dns_data, failure_freshness)
+        } else {
+            let cache_ttl = crate::dns_parser::extract_cache_ttl(dns_data)
+                .ok()
+                .flatten()
+                .unwrap_or(0);
+            ("public", cache_ttl)
+        };
 
-    let cache_control = format!("public, max-age={cache_ttl}");
+    let cache_control = format!("{scope}, max-age={cache_ttl}");
     if let Ok(value) = header::HeaderValue::from_str(&cache_control) {
         response.headers_mut().insert(header::CACHE_CONTROL, value);
     }
@@ -308,17 +264,41 @@ fn add_cache_headers(response: &mut Response<Full<Bytes>>, dns_data: &[u8]) {
     debug!("DoH response with cache TTL: {cache_ttl} seconds");
 }
 
+/// How long HTTP caches may keep a SERVFAIL.
+///
+/// When no upstream server can get the query, the SERVFAIL may stay until one can.
+/// Its records can make this shorter. Otherwise, it must not be reused.
+fn failure_cache_ttl(
+    dns_data: &[u8],
+    failure_freshness: Option<FailureFreshness>,
+) -> (&'static str, u32) {
+    let Some(failure_freshness) = failure_freshness else {
+        return ("private", 0);
+    };
+    let remaining = failure_freshness
+        .retry_at
+        .saturating_duration_since(tokio::time::Instant::now())
+        .as_secs();
+    let mut cache_ttl = u32::try_from(remaining).unwrap_or(u32::MAX);
+    if let Ok(Some(record_ttl)) = crate::dns_parser::extract_cache_ttl(dns_data) {
+        cache_ttl = cache_ttl.min(record_ttl);
+    }
+    let scope = if failure_freshness.shared {
+        "public"
+    } else {
+        "private"
+    };
+    (scope, cache_ttl)
+}
+
 /// Start the DNS-over-HTTPS (DoH) server
 pub async fn start_doh_server(
     listener: TcpListener,
     query_manager: Arc<QueryManager>,
-    upstream_servers: Vec<String>,
     server_timeout: u64,
     dns_packet_len_max: usize,
-    stats: Arc<SharedStats>,
     max_connections: usize,
     rate_limiter: Option<Arc<crate::rate_limiter::RateLimiter>>,
-    load_balancing_strategy: crate::load_balancer::LoadBalancingStrategy,
     ip_validator: Option<Arc<crate::ip_validator::IpValidator>>,
     enable_strict_ip_validation: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -336,8 +316,6 @@ pub async fn start_doh_server(
 
         // Clone the values we need for this connection
         let query_manager = query_manager.clone();
-        let upstream_servers = upstream_servers.clone();
-        let stats = stats.clone();
         let semaphore = semaphore.clone();
         let rate_limiter = rate_limiter.clone();
         let ip_validator = ip_validator.clone();
@@ -365,11 +343,8 @@ pub async fn start_doh_server(
                 io,
                 client_addr,
                 query_manager,
-                upstream_servers,
                 server_timeout,
                 dns_packet_len_max,
-                stats,
-                load_balancing_strategy,
                 rate_limiter,
             )
             .await;
@@ -415,19 +390,14 @@ async fn handle_http_connection(
     io: TokioIo<tokio::net::TcpStream>,
     client_addr: SocketAddr,
     query_manager: Arc<QueryManager>,
-    upstream_servers: Vec<String>,
     server_timeout: u64,
     dns_packet_len_max: usize,
-    stats: Arc<SharedStats>,
-    load_balancing_strategy: crate::load_balancer::LoadBalancingStrategy,
     rate_limiter: Option<Arc<crate::rate_limiter::RateLimiter>>,
 ) {
     // Create a service function to handle HTTP requests
     let client_addr_clone = client_addr;
     let service = hyper::service::service_fn(move |req| {
         let query_manager = query_manager.clone();
-        let upstream_servers = upstream_servers.clone();
-        let stats = stats.clone();
         let client_addr = client_addr_clone;
         let rate_limiter = rate_limiter.clone();
 
@@ -444,11 +414,8 @@ async fn handle_http_connection(
             handle_doh_request(
                 req,
                 query_manager,
-                upstream_servers,
                 server_timeout,
                 dns_packet_len_max,
-                stats,
-                load_balancing_strategy,
                 client_addr,
             )
             .await
@@ -569,11 +536,8 @@ mod tests {
             TokioIo::new(stream),
             client_addr,
             Arc::new(QueryManager::for_tests(1, 4096, true)),
-            vec!["127.0.0.1:9".to_string()],
             1,
             4096,
-            Arc::new(SharedStats::new()),
-            crate::load_balancer::LoadBalancingStrategy::Random,
             None,
         );
 
@@ -594,7 +558,7 @@ mod tests {
             2, 1,
         ];
 
-        let http_response = create_dns_response(&response);
+        let http_response = create_dns_response(&response, None);
 
         assert_eq!(
             http_response.headers()[header::CACHE_CONTROL],
@@ -604,12 +568,132 @@ mod tests {
 
     #[test]
     fn test_negative_response_uses_soa_minimum_for_http_cache() {
-        let response =
-            create_dns_response(crate::dns_parser::NEGATIVE_RESPONSE_WITH_SOA_TTL_3600_MINIMUM_60);
+        let response = create_dns_response(
+            crate::dns_parser::NEGATIVE_RESPONSE_WITH_SOA_TTL_3600_MINIMUM_60,
+            None,
+        );
 
         assert_eq!(
             response.headers()[header::CACHE_CONTROL],
             "public, max-age=60"
         );
+    }
+
+    fn servfail(response: &[u8]) -> Vec<u8> {
+        let mut response = response.to_vec();
+        crate::dns_parser::set_rcode(&mut response, crate::dns_processor::DNS_RCODE_SERVFAIL)
+            .unwrap();
+        response
+    }
+
+    fn cache_control(response: &[u8], failure_freshness: Option<FailureFreshness>) -> String {
+        let http_response = create_dns_response(response, failure_freshness);
+        assert_eq!(
+            http_response.headers()[header::CONTENT_TYPE],
+            "application/dns-message"
+        );
+        http_response.headers()[header::CACHE_CONTROL]
+            .to_str()
+            .unwrap()
+            .to_string()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_servfail_is_fresh_until_a_retry() {
+        let mut response = servfail(crate::dns_parser::EXAMPLE_COM_QUERY);
+        crate::dns_parser::set_qr(&mut response, true).unwrap();
+        let freshness = FailureFreshness {
+            retry_at: tokio::time::Instant::now() + Duration::from_secs(30),
+            shared: true,
+        };
+
+        assert_eq!(
+            cache_control(&response, Some(freshness)),
+            "public, max-age=30"
+        );
+
+        // Later requests don't start the delay again
+        tokio::time::advance(Duration::from_millis(10500)).await;
+        assert_eq!(
+            cache_control(&response, Some(freshness)),
+            "public, max-age=19"
+        );
+        tokio::time::advance(Duration::from_secs(20)).await;
+        assert_eq!(
+            cache_control(&response, Some(freshness)),
+            "public, max-age=0"
+        );
+
+        // A failure that depends on the client's address is private
+        let private = FailureFreshness {
+            shared: false,
+            ..freshness
+        };
+        assert_eq!(
+            cache_control(&response, Some(private)),
+            "private, max-age=0"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_servfail_records_only_shorten_the_freshness() {
+        let response = servfail(crate::dns_parser::NEGATIVE_RESPONSE_WITH_SOA_TTL_3600_MINIMUM_60);
+        let retry_in = |seconds| FailureFreshness {
+            retry_at: tokio::time::Instant::now() + Duration::from_secs(seconds),
+            shared: true,
+        };
+
+        assert_eq!(cache_control(&response, None), "private, max-age=0");
+        assert_eq!(
+            cache_control(&response, Some(retry_in(300))),
+            "public, max-age=60"
+        );
+        assert_eq!(
+            cache_control(&response, Some(retry_in(30))),
+            "public, max-age=30"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_servfail_is_a_dns_message() {
+        let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream = udp.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut packet = vec![0u8; 4096];
+            while let Ok((length, client)) = udp.recv_from(&mut packet).await {
+                let mut response = servfail(&packet[..length]);
+                crate::dns_parser::set_qr(&mut response, true).unwrap();
+                udp.send_to(&response, client).await.unwrap();
+            }
+        });
+        let mut query_manager = QueryManager::for_tests(2, 4096, true);
+        query_manager
+            .set_failure_policy(crate::failure_cache::FailurePolicy::new(10, 10, 30).unwrap());
+        query_manager.set_upstream_servers(vec![upstream]);
+        let query_manager = Arc::new(query_manager);
+        // Like most DoH clients, with ID 0, so that HTTP caches can reuse the response
+        let mut query = crate::dns_parser::EXAMPLE_COM_QUERY.to_vec();
+        crate::dns_parser::set_tid(&mut query, 0).unwrap();
+
+        // The SERVFAIL of the upstream server, then ours while it is in backoff
+        for _ in 0..2 {
+            let response = process_dns_message(
+                query.clone(),
+                query_manager.clone(),
+                &"192.0.2.1:443".parse().unwrap(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.headers()[header::CACHE_CONTROL],
+                "public, max-age=9"
+            );
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(
+                crate::dns_parser::rcode(&body),
+                crate::dns_processor::DNS_RCODE_SERVFAIL
+            );
+        }
     }
 }

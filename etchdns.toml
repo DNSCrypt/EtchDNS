@@ -99,6 +99,18 @@ negative_cache_ttl = 60
 # In authoritative mode, original TTLs are still returned to clients
 min_cache_ttl = 1
 
+# Number of queries whose upstream failures are remembered (default: 1024)
+# After a SERVFAIL or a timeout, the server gets the same query again only after a delay
+# Until then, clients get a stale answer or a SERVFAIL at once, if no other server can get the query
+# Set to 0 to always ask again: clients still get a SERVFAIL when no server answers
+failure_cache_size = 1024
+
+# First and longest delays in seconds before a server gets a query that it failed again
+# Each new failure of the same query doubles the delay: 1, 2, 4, 8, 16, 30, 30...
+# Must satisfy 1 <= failure_backoff_min <= failure_backoff_max <= 300 (defaults: 1 and 30)
+failure_backoff_min = 1
+failure_backoff_max = 30
+
 #------------------------------------------------------------------------------
 # Domain Filtering
 #------------------------------------------------------------------------------
