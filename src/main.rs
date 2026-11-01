@@ -1852,25 +1852,22 @@ async fn main() -> EtchDnsResult<()> {
     for doh_listener in doh_listeners {
         // Clone the values we need for the DoH server
         let query_manager = query_manager.clone();
-        let server_timeout = config.server_timeout;
-        let dns_packet_len_max = config.dns_packet_len_max;
         let max_connections = config.max_doh_connections;
         let doh_rate_limiter = doh_rate_limiter.clone();
 
         // Clone the IP validator for this task
-        let doh_ip_validator = ip_validator.clone();
+        let doh_ip_validator = config
+            .enable_strict_ip_validation
+            .then(|| ip_validator.clone());
 
         // Create a task for the DoH server
         let doh_task = tokio::spawn(async move {
             if let Err(e) = doh::start_doh_server(
                 doh_listener,
                 query_manager,
-                server_timeout,
-                dns_packet_len_max,
                 max_connections,
                 doh_rate_limiter,
-                Some(doh_ip_validator),
-                config.enable_strict_ip_validation,
+                doh_ip_validator,
             )
             .await
             {
